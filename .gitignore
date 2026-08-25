@@ -1,0 +1,84 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+env/
+venv/
+ENV/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Results and logs (regeneratable)
+results/
+logs/
+*.log
+*.lock
+*.tmp
+benchmark_all.log
+
+# Temp files
+temp/
+
+# Pip artifacts (malformed installs)
+=*
+
+# Draft documents (not for repo)
+COHT_*.txt
+COHT_*.md
+ADVERSARIAL_*.md
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Model weights and caches
+*.pt
+*.pth
+*.bin
+*.safetensors
+.cache/
+cache/
+huggingface/
+
+# CUDA compilation
+csrc/build/
+*.cubin
+*.fatbin
+
+llmdocs
+paper
+.hf_token
+
+scripts/*.py
+
+# Claude Code local state
+.claude/
+CLAUDE.md

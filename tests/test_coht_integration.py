@@ -1,0 +1,202 @@
+"""
+CRITICAL CHECK: Does COHT integrate with SINQ's dequantization?
+"""
+import torch
+import numpy as np
+from sinq.sinkhorn import sinkhorn_log
+
+def generate_hadamard(n):
+    if n == 1:
+        return torch.tensor([[1.0]])
+    H_half = generate_hadamard(n // 2)
+    H = torch.zeros(n, n, dtype=torch.float32)
+    H[:n//2, :n//2] = H_half
+    H[:n//2, n//2:] = H_half
+    H[n//2:, :n//2] = H_half
+    H[n//2:, n//2:] = -H_half
+    return H / np.sqrt(2)
+
+print("="*80)
+print("COHT + SINQ DEQUANTIZATION INTEGRATION")
+print("="*80)
+
+print("\n1. HOW SINQ CURRENTLY STORES MU1, MU2")
+print("-" * 80)
+print("From dual_shift.py lines 195-196:")
+print("  scales2 = torch.ones(1,matrix.shape[1]).to(dev).to(mu1.dtype) * mu1")
+print("  scales = scales*mu2")
+print("")
+print("Translation:")
+print("  s1 (per-row scale) = quantization_scale * mu2")
+print("  s2 (per-column scale) = mu1")
+print("")
+
+print("\n2. STANDARD SINQ DEQUANTIZATION")
+print("-" * 80)
+print("From quantizer.py line 316:")
+print("  W_r = ((W_r - z) * s).reshape(meta['shape']) * s2_eff")
+print("")
+print("Breaking it down:")
+print("  W_r = (Q - zero) * s1  # per-row dequant")
+print("  W_r = W_r * s2         # per-column scale")
+print("")
+print("Substituting s1 and s2:")
+print("  W_r = (Q - zero) * (quant_scale * mu2) * mu1")
+print("     = ((Q - zero) * quant_scale) * mu2 * mu1")
+print("")
+print("So the standard dequant gives us:")
+print("  W_reconstructed = W_normalized * mu2 * mu1")
+print("")
+print("where W_normalized = (Q - zero) * quant_scale (the dequantized values)")
+print("")
+
+print("\n3. WHAT COHT NEEDS")
+print("-" * 80)
+print("COHT forward:")
+print("  W_rotated = W_original @ H.T")
+print("  W_normalized, mu1, mu2 = sinkhorn_log(W_rotated, 16)")
+print("  Q = quantize(W_normalized)")
+print("")
+print("COHT inverse needs:")
+print("  W_reconstructed = (dequantize(Q) * mu1 * mu2) @ H")
+print("                 = (W_normalized * mu1 * mu2) @ H")
+print("                 = W_rotated @ H")
+print("                 = W_original")
+print("")
+
+print("\n4. THE PROBLEM")
+print("-" * 80)
+print("Standard SINQ dequant gives: W_normalized * mu2 * mu1")
+print("COHT needs to then apply:    @ H128")
+print("")
+print("So we need:")
+print("  W_final = (standard_dequant) @ H128")
+print("         = (W_normalized * mu2 * mu1) @ H128  ✓")
+print("")
+print("This is EXACTLY what the proposal suggests!")
+print("")
+
+print("\n5. IMPLEMENTATION PATH")
+print("-" * 80)
+print("Current SINQ flow:")
+print("  1. Unpack bits -> Q")
+print("  2. Dequantize -> W = ((Q - z) * s1) * s2")
+print("  3. Return W")
+print("")
+print("COHT modification needed:")
+print("  1. Unpack bits -> Q")
+print("  2. Dequantize -> W = ((Q - z) * s1) * s2")
+print("  3. Apply Hadamard -> W = W @ H128  # NEW STEP")
+print("  4. Return W")
+print("")
+print("The Hadamard application happens AFTER standard dequant!")
+print("This is actually very clean - just one extra matmul.")
+print("")
+
+print("\n6. WHERE TO INJECT THE HADAMARD")
+print("-" * 80)
+print("Option 1: Modify Quantizer.dequantize() in quantizer.py")
+print("  - Add a flag 'coht': bool in meta")
+print("  - If coht=True, apply @ H128 after line 316")
+print("  - Pro: Centralized, clean")
+print("  - Con: Adds overhead to dequantization path")
+print("")
+print("Option 2: Apply in forward pass of Linear layer")
+print("  - In sinq/linear.py forward(), after dequant, apply @ H")
+print("  - Pro: Only pays cost during actual forward pass")
+print("  - Con: Need to modify Linear.forward()")
+print("")
+print("Option 3: Pre-compute at load time")
+print("  - When loading quantized model, immediately apply W @ H")
+print("  - Store the result")
+print("  - Pro: Zero inference overhead")
+print("  - Con: Increased memory footprint (defeats purpose of quantization!)")
+print("")
+
+print("\n7. VERIFYING THE INTEGRATION")
+print("-" * 80)
+
+W_original = torch.randn(256, 128)
+H128 = generate_hadamard(128)
+
+# Forward (COHT)
+W_rotated = W_original @ H128.T
+W_normalized, mu1, mu2 = sinkhorn_log(W_rotated, 16)
+
+# Simulate quantization (skip actual quantize/dequant for now)
+# In real code, W_normalized would be quantized, then dequantized
+
+# SINQ standard dequant output (from quantizer.py line 316)
+# This is what we'd get after ((Q - z) * s1) * s2
+W_from_standard_dequant = W_normalized * mu2 * mu1
+
+# Apply COHT's Hadamard inverse
+W_reconstructed_coht = W_from_standard_dequant @ H128
+
+error = (W_original - W_reconstructed_coht).abs().max().item()
+
+print(f"Reconstruction error: {error:.9f}")
+print("")
+if error < 1e-5:
+    print("✓ INTEGRATION IS MATHEMATICALLY CORRECT")
+    print("")
+    print("The proposal just needs one extra operation after standard dequant:")
+    print("  W_final = standard_dequant(Q, meta) @ H128")
+else:
+    print("✗ INTEGRATION HAS ERRORS")
+
+print("")
+print("\n8. STORAGE REQUIREMENTS")
+print("-" * 80)
+print("Additional storage for COHT:")
+print("  - H128 matrix: NOT stored (generated on-the-fly)")
+print("  - Meta flag 'coht': 1 bit per layer")
+print("  - mu1, mu2: ALREADY stored in s1, s2")
+print("")
+print("Total overhead: ~0 bytes (just a boolean flag)")
+print("")
+
+print("\n9. COMPUTE OVERHEAD")
+print("-" * 80)
+print("Per-layer inference cost:")
+print("  Standard: x @ W_dequant")
+print("  With COHT: x @ (W_dequant @ H128)")
+print("")
+print("Can't pre-compute W_dequant @ H128 because:")
+print("  - W_dequant happens on-the-fly from packed bits")
+print("  - Pre-computing would require storing full fp16 weights (defeats quantization)")
+print("")
+print("So the overhead is ONE extra matmul per layer:")
+print("  W_dequant @ H128 where W_dequant is [H x 128] and H128 is [128 x 128]")
+print("")
+print("For tiled weights [H x W] with tile_size=128:")
+print("  - Number of tiles: W / 128")
+print("  - Each tile: [H x 128] @ [128 x 128] = H * 128 * 128 FLOPs")
+print("  - Total: H * W * 128 FLOPs for all tiles")
+print("")
+print("Compare to inference matmul: x @ W_dequant")
+print("  - x shape: [batch * seq_len, d_model]")
+print("  - W_dequant shape: [d_model, d_out]")
+print("  - Cost: batch * seq_len * d_model * d_out FLOPs")
+print("")
+print("Overhead percentage depends on batch_size and seq_len.")
+print("For typical inference (batch=1, seq_len=1 for generation):")
+print("  Inference: 1 * 1 * d_model * d_out = d_model * d_out")
+print("  Hadamard: d_model * d_out * 128")
+print("  Overhead: (d_model * d_out * 128) / (d_model * d_out) = 128 = 12800%!")
+print("")
+print("✗ MASSIVE OVERHEAD FOR LOW BATCH/SEQ_LEN INFERENCE")
+print("")
+
+print("\n" + "="*80)
+print("FINAL ASSESSMENT")
+print("="*80)
+print("✓ Mathematically correct")
+print("✓ Zero storage overhead")
+print("✓ Clean integration point exists")
+print("✗ CRITICAL: Unacceptable inference overhead for token generation")
+print("")
+print("The overhead is ONLY acceptable for high batch/seq_len scenarios.")
+print("For typical LLM generation (batch=1, seq=1), the Hadamard inverse")
+print("costs MORE than the actual inference matmul!")
+print("="*80)

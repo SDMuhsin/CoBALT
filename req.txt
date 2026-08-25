@@ -1,0 +1,15 @@
+huggingface-hub==0.34.4
+hf_transfer==0.1.9
+einops==0.8.1
+datasets
+numpy
+scipy==1.13.1
+transformers==4.55.0
+accelerate
+torch
+torchaudio
+torchvision
+lm_eval
+safetensors
+termcolor
+gemlite==0.5.1.post1
