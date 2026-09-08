@@ -1442,18 +1442,25 @@ class SparseGPTLayerWrapper:
                 Err1 = torch.zeros_like(W1)
                 Hinv1 = Hinv[i1:i2, i1:i2]
 
-                if fixed_mask is None:
+                if fixed_mask is None and NM_PATTERN is not None:
+                    # N:M (2:4 route): decided per m-group INSIDE the column loop below on the
+                    # already-compensated W1, exactly as the reference SparseGPT prune_n/prune_m path.
+                    mask1 = torch.zeros_like(W1, dtype=torch.bool)
+                elif fixed_mask is None:
                     # Compute pruning mask for this block using OBS criterion
                     tmp = W1 ** 2 / (torch.diag(Hinv1).reshape((1, -1))) ** 2
                     thresh = torch.sort(tmp.flatten())[0][int(tmp.numel() * sparsity)]
                     mask1 = tmp <= thresh
                 else:
                     mask1 = fixed_mask[:, i1:i2]
-                full_mask[:, i1:i2] = mask1
 
                 for i in range(count):
                     w = W1[:, i]
                     d = Hinv1[i, i]
+                    if fixed_mask is None and NM_PATTERN is not None and i % NM_PATTERN[1] == 0:
+                        nn_, mm_ = NM_PATTERN
+                        tmp = W1[:, i:i + mm_] ** 2 / (torch.diag(Hinv1)[i:i + mm_].reshape((1, -1))) ** 2
+                        mask1.scatter_(1, i + torch.topk(tmp, mm_ - nn_, dim=1, largest=False)[1], True)
 
                     q = w.clone()
                     q[mask1[:, i]] = 0  # Prune
@@ -1475,6 +1482,7 @@ class SparseGPTLayerWrapper:
                     Err1[:, i] = err1
 
                 W[:, i1:i2] = Q1
+                full_mask[:, i1:i2] = mask1
 
                 # Propagate error to remaining columns
                 W[:, i2:] -= Err1.matmul(Hinv[i1:i2, i2:])
@@ -2817,6 +2825,20 @@ def _wanda_scaler_row(acts: torch.Tensor, device: str) -> torch.Tensor:
     return X.pow(2).mean(dim=0)  # [N]
 
 
+# N:M semi-structured switch (2:4 route), mirrored from nosink.NM_PATTERN; set by camera_bench --nm.
+# Applies to the wanda/balanced masks of the AWQ/SINQ baselines and to SparseGPT's in-loop OBS mask.
+NM_PATTERN = None
+
+
+def _nm_keep_mask(importance: torch.Tensor, n: int, m: int) -> torch.Tensor:
+    K, N = importance.shape
+    assert N % m == 0, f"N={N} not divisible by m={m} for {n}:{m} sparsity"
+    g = importance.view(K, N // m, m)
+    mask = torch.zeros_like(g)
+    mask.scatter_(-1, g.topk(n, dim=-1).indices, 1.0)
+    return mask.view(K, N)
+
+
 def _wanda_row_mask(W: torch.Tensor, scaler_row: torch.Tensor, sparsity: float) -> torch.Tensor:
     """Per-output-row Wanda prune mask (1 = keep, 0 = prune).
 
@@ -2825,11 +2847,68 @@ def _wanda_row_mask(W: torch.Tensor, scaler_row: torch.Tensor, sparsity: float) 
     """
     W_metric = W.abs().float() * torch.sqrt(scaler_row.reshape(1, -1))
     K, N = W.shape
+    if NM_PATTERN is not None and sparsity > 0.0:
+        return _nm_keep_mask(W_metric, *NM_PATTERN)
     n_prune = int(N * sparsity)
     mask = torch.ones_like(W_metric)
     if n_prune > 0:
         idx = torch.sort(W_metric, dim=1, stable=True)[1][:, :n_prune]
         mask.scatter_(1, idx, 0.0)
+    return mask
+
+
+def _balanced_col_mask(W, scaler_row, sparsity, beta=0.5, floor_frac=0.0, protect=0.0, adapt=0.0):
+    """CoBALT column-BALANCED keep-mask under the SAME importance |W|*sqrt(scaler_row) as wanda, so a
+    cobalt-mask+SINQ arm isolates the MASK (balance) from the quantizer. Row+col (1-sp)-quantile self-norm
+    then a GLOBAL top-k (identical to nosink.balanced_keepmask_local)."""
+    imp = W.abs().float() * torch.sqrt(scaler_row.reshape(1, -1))
+    K, N = imp.shape
+    kr, kc = int(N * sparsity), int(K * sparsity)
+    if adapt > 0.0:
+        # ADAPTIVE beta (#39, NOVEL): set the column-balance strength PER-MATRIX from a one-shot signal =
+        # the demotion-rate of raw-top-k important entries under STRONG balance (beta=1.0). LOW demotion =>
+        # matrix tolerates strong balance (use beta~1.0, captures opt-like gain); HIGH demotion => strong
+        # balance would demote important entries (collapse) => use moderate beta. Monotonic-measured signal.
+        _raw = imp.reshape(-1); _nk = int((1.0 - sparsity) * K * N)
+        _rawtop = torch.zeros_like(_raw, dtype=torch.bool)
+        if _nk > 0:
+            _rawtop[torch.topk(_raw, _nk).indices] = True
+        _m1 = _balanced_col_mask(W, scaler_row, sparsity, beta=1.0).reshape(-1).bool()
+        _dem = (_rawtop & ~_m1).float().sum().item() / max(int(_rawtop.sum().item()), 1)
+        # map demotion -> beta: ceiling _bhi (conservative <1.0 avoids pushing noisy per-matrix to the
+        # beta=1.0 collapse), floor 0.6, slope=adapt, d0=0.11. _bhi = protect if set else 1.0.
+        _bhi = protect if protect > 0.0 else 1.0
+        beta = float(min(_bhi, max(0.6, _bhi - adapt * max(0.0, _dem - 0.11))))
+    if kr > 0:
+        imp = imp / torch.kthvalue(imp, kr, dim=1, keepdim=True).values.clamp(min=1e-30)
+    if kc > 0:
+        imp = imp / torch.kthvalue(imp, kc, dim=0, keepdim=True).values.clamp(min=1e-30).pow(beta)
+    n_prune = int(K * N * sparsity)
+    if n_prune <= 0:
+        return torch.ones_like(imp)
+    if NM_PATTERN is not None:
+        # 2:4 route: the balanced (row+col^beta quantile-normalized) importance decides the top-n per
+        # m-group instead of a global top-k. Only the column term can change the selection.
+        return _nm_keep_mask(imp, *NM_PATTERN)
+    if protect > 0.0:
+        # SALIENCY-PROTECTED strong balance (#38): guarantee the top-`protect` fraction of the survivor
+        # budget by RAW importance is kept (never demoted by balance), fill the rest by the balanced score.
+        # Targets the beta=1.0 collapse = balance DEMOTING high-importance entries. exact budget preserved.
+        raw = (W.abs().float() * torch.sqrt(scaler_row.reshape(1, -1))).reshape(-1)
+        n_keep = K * N - n_prune
+        n_prot = int(protect * n_keep)
+        prot_idx = torch.topk(raw, n_prot).indices if n_prot > 0 else raw.new_empty(0, dtype=torch.long)
+        bscore = imp.reshape(-1).clone()
+        bscore[prot_idx] = float('inf')                       # force-keep protected core
+        thr = torch.kthvalue(bscore, n_prune).values
+        return (bscore > thr).view(K, N).float()
+    thr = torch.kthvalue(imp.reshape(-1), n_prune).values
+    mask = (imp.reshape(-1) > thr).view(K, N).float()
+    if floor_frac > 0.0:
+        import sys as _s, os as _o
+        _s.path.insert(0, _o.path.join(_o.path.dirname(_o.path.dirname(_o.path.abspath(__file__))), "src"))
+        import nosink as _ns
+        mask = _ns.column_floor_mask(mask, imp, sparsity, floor_frac)
     return mask
 
 
@@ -3149,14 +3228,27 @@ def _effective_sparsity(attr_path, sparsity, sparsity_by_type):
 
 def apply_wanda_awq_quantization(model, calibration_data, nbits: int, sparsity: float,
                                  device: str = 'cuda', groupsize: int = 128,
-                                 sparsity_by_type: dict = None) -> nn.Module:
+                                 sparsity_by_type: dict = None, repack: bool = False,
+                                 binc: bool = False, awclipz: bool = False,
+                                 awclip: bool = False,
+                                 balanced: bool = False, cobalt_beta: float = 0.5, floor_frac: float = 0.0, protect: float = 0.0, adapt: float = 0.0) -> nn.Module:
     """Wanda pruning + AWQ quantization of the surviving weights.
 
     Composes the existing `wanda` per-row mask with AWQ: prune, AWQ-quantize the
     pruned matrix, then re-impose the zeros so structural sparsity is exact.
     `sparsity_by_type` (optional) enables per-type sparsity (e.g. v-dense) — held EQUAL
     across arms for the fairness comparison; default None = uniform `sparsity`.
+
+    repack=True (math4 fairness): keep the AWQ per-column scale + Wanda mask, but
+    store survivors in the repacked format (survivor-only b'-bit codes, survivor-hull
+    grids at group=128) instead of b-bit codes at every position. Same storage lever
+    given to cobalt-repack, applied to this baseline's own normalization.
     """
+    if repack or binc or awclipz or awclip:
+        import sys as _sys, os as _os
+        _sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.dirname(
+            _os.path.abspath(__file__))), "src"))
+        import eout_quant as _eq
     layer_activations = collect_activations(model, calibration_data, device)
     layer_paths = get_layer_paths(model)
     min_max = [0, 2 ** nbits - 1]
@@ -3185,13 +3277,29 @@ def apply_wanda_awq_quantization(model, calibration_data, nbits: int, sparsity: 
             acts = layer_activations.get(f'layer_{layer_idx}.{attr_path}', None)
             if acts is not None:
                 scaler_row = _wanda_scaler_row(acts, device)
-                mask = _wanda_row_mask(W, scaler_row, sp)
+                mask = (_balanced_col_mask(W, scaler_row, sp, cobalt_beta, floor_frac, protect, adapt) if balanced
+                        else _wanda_row_mask(W, scaler_row, sp))
                 W_pruned = W * mask
                 acts_d = acts.to(device).float()
                 awq_scales = compute_awq_scale(W_pruned, acts_d, min_max, tile=block, method='awq')
-                W_fq = tiled_fake_quant_rectangle(
-                    W_pruned, fakequant=rtn_fake_quant, min_max=min_max, block=block, scales=awq_scales
-                ) * mask
+                if (repack or binc or awclipz or awclip) and sp > 0.0:
+                    # AWQ decode is ((q-z)*s) / awq_scales -> c = 1/awq_scales, r = 1.
+                    r = torch.ones(W.shape[0], device=device)
+                    c = (1.0 / awq_scales.to(device).float().clamp(min=1e-8)).view(-1)
+                    if awclip:  # fairness: give the mask-agnostic awclip SCALE lever to AWQ too
+                        colE = (acts_d.reshape(-1, acts_d.shape[-1]) ** 2).sum(0).clamp(min=0)
+                        W_fq = _eq.awclip_only(W_pruned, mask, nbits, block, r, c, colE)
+                    elif awclipz:  # give the mask-agnostic awclipz scale+zero lever to AWQ too
+                        colE = (acts_d.reshape(-1, acts_d.shape[-1]) ** 2).sum(0).clamp(min=0)
+                        W_fq = _eq.awclipz_only(W_pruned, mask, nbits, block, r, c, colE)
+                    elif binc:  # fairness: give the mask-agnostic bin-center lever to AWQ too
+                        W_fq = _eq.bincenter_only(W_pruned, mask, nbits, block, r, c)
+                    else:
+                        W_fq, _ = _eq.repack_only(W_pruned, mask, nbits, 128, r, c)
+                else:
+                    W_fq = tiled_fake_quant_rectangle(
+                        W_pruned, fakequant=rtn_fake_quant, min_max=min_max, block=block, scales=awq_scales
+                    ) * mask
             else:
                 W_fq = tiled_fake_quant_rectangle(
                     W, fakequant=rtn_fake_quant, min_max=min_max, block=block,
@@ -3211,14 +3319,27 @@ def apply_wanda_awq_quantization(model, calibration_data, nbits: int, sparsity: 
 
 
 def apply_wanda_sinq_quantization(model, calibration_data, nbits: int, sparsity: float,
-                                  device: str = 'cuda', sparsity_by_type: dict = None) -> nn.Module:
+                                  device: str = 'cuda', sparsity_by_type: dict = None,
+                                  repack: bool = False, binc: bool = False,
+                                  awclipz: bool = False, awclip: bool = False,
+                                  balanced: bool = False, cobalt_beta: float = 0.5, floor_frac: float = 0.0, protect: float = 0.0, adapt: float = 0.0) -> nn.Module:
     """Wanda pruning + SINQ quantization of the surviving weights.
 
     The naive composition (off-the-shelf SINQ run on the pruned matrix, i.e.
     sparsity-*unaware* Sinkhorn) — this is the baseline PRISM's sparse-aware
     Sinkhorn improves upon. `sparsity_by_type` (optional) enables per-type sparsity
     (e.g. v-dense), held equal across arms; default None = uniform `sparsity`.
+
+    repack=True (math4 fairness): keep the Sinkhorn dual normalization (mu1 col,
+    mu2 row) + Wanda mask, but store survivors in the repacked format (survivor-only
+    b'-bit codes, survivor-hull grids at group=128, nbits pinned = no adaptive-nbits
+    bpw drift). Same storage lever as cobalt-repack, on SINQ's own normalization.
     """
+    if repack or binc or awclipz or awclip:
+        import sys as _sys, os as _os
+        _sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.dirname(
+            _os.path.abspath(__file__))), "src"))
+        import eout_quant as _eq
     layer_activations = collect_activations(model, calibration_data, device)
     layer_paths = get_layer_paths(model)
 
@@ -3244,15 +3365,34 @@ def apply_wanda_sinq_quantization(model, calibration_data, nbits: int, sparsity:
             acts = layer_activations.get(f'layer_{layer_idx}.{attr_path}', None)
             if acts is not None:
                 scaler_row = _wanda_scaler_row(acts, device)
-                mask = _wanda_row_mask(W, scaler_row, sp)
+                mask = (_balanced_col_mask(W, scaler_row, sp, cobalt_beta, floor_frac, protect, adapt) if balanced
+                        else _wanda_row_mask(W, scaler_row, sp))
             else:
                 mask = torch.ones_like(W)
             W_pruned = W * mask
 
-            actual_nbits = get_adaptive_nbits(W_pruned, nbits)
-            min_max = [0, 2 ** actual_nbits - 1]
-            W_q, s1, s2, z = quantize_dual_scale_shift(W_pruned, min_max, method='sinq')
-            W_deq = _sinq_dequantize_dense(W_q, s1, s2, z) * mask
+            if (repack or binc or awclipz or awclip) and sp > 0.0 and acts is not None:
+                # Keep Sinkhorn dual normalization; swap survivor coding (repack/binc/awclip(z)).
+                _, mu1, mu2 = sinkhorn_log(W_pruned.to(device), 16)
+                r = mu2.to(device).float().view(-1)            # [K] per-row
+                c = mu1.to(device).float().view(-1)            # [N] per-col
+                if awclip:  # fairness: give the awclip SCALE lever to SINQ too
+                    _ad = acts.to(device).float()
+                    colE = (_ad.reshape(-1, _ad.shape[-1]) ** 2).sum(0).clamp(min=0)
+                    W_deq = _eq.awclip_only(W_pruned, mask, nbits, 128, r, c, colE)
+                elif awclipz:  # give the awclipz scale+zero lever to SINQ too
+                    _ad = acts.to(device).float()
+                    colE = (_ad.reshape(-1, _ad.shape[-1]) ** 2).sum(0).clamp(min=0)
+                    W_deq = _eq.awclipz_only(W_pruned, mask, nbits, 128, r, c, colE)
+                elif binc:  # fairness: give the bin-center lever to SINQ too
+                    W_deq = _eq.bincenter_only(W_pruned, mask, nbits, 128, r, c)
+                else:
+                    W_deq, _ = _eq.repack_only(W_pruned, mask, nbits, 128, r, c)
+            else:
+                actual_nbits = get_adaptive_nbits(W_pruned, nbits)
+                min_max = [0, 2 ** actual_nbits - 1]
+                W_q, s1, s2, z = quantize_dual_scale_shift(W_pruned, min_max, method='sinq')
+                W_deq = _sinq_dequantize_dense(W_q, s1, s2, z) * mask
 
             new_layer = SparseLinear(W_deq.to(linear.weight.dtype), bias).to(device)
             setattr(parent, parts[-1], new_layer)

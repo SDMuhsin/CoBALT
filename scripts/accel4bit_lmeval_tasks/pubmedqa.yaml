@@ -1,0 +1,26 @@
+# accel4bit override of lm_eval's builtin `pubmedqa` task (identical prompt/choices/metric/split).
+# Only the data source differs: lm_eval 0.4.13 points at the script-based `bigbio/pubmed_qa`
+# (config pubmed_qa_labeled_fold0_source), which `datasets>=4` refuses to load
+# ("Dataset scripts are no longer supported, but found pubmed_qa.py"). We load the HF-generated
+# parquet conversion of the SAME config/splits (refs/convert/parquet branch; test = 500 docs).
+# Use: lm_eval --include_path scripts/accel4bit_lmeval_tasks ...
+task: pubmedqa
+dataset_path: parquet
+dataset_kwargs:
+  data_files:
+    train: hf://datasets/bigbio/pubmed_qa@refs/convert/parquet/pubmed_qa_labeled_fold0_source/train/0000.parquet
+    validation: hf://datasets/bigbio/pubmed_qa@refs/convert/parquet/pubmed_qa_labeled_fold0_source/validation/0000.parquet
+    test: hf://datasets/bigbio/pubmed_qa@refs/convert/parquet/pubmed_qa_labeled_fold0_source/test/0000.parquet
+output_type: multiple_choice
+training_split: train
+validation_split: validation
+test_split: test
+doc_to_text: !function preprocess_pubmedqa.doc_to_text
+doc_to_target: final_decision
+doc_to_choice: ["yes", "no", "maybe"]
+metric_list:
+  - metric: acc
+    aggregation: mean
+    higher_is_better: true
+metadata:
+  version: 1.0

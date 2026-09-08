@@ -44,7 +44,7 @@ import benchmark_suite as bs  # noqa: E402
 import nosink as ns  # noqa: E402
 from transformers import AutoModelForCausalLM, AutoTokenizer  # noqa: E402
 
-MODEL = "gemma-2b"  # overridden by --model in main()
+MODEL = "gemma-2b"  # overridden by --model in main
 DEV = "cuda"
 TYPES = ["q", "k", "v", "o", "gate", "up", "down"]
 
@@ -54,13 +54,21 @@ PPL_TASKS = ["wikitext2", "ptb", "c4"]
 DS_TASKS = ["arc_easy", "arc_challenge", "hellaswag", "winogrande"]
 
 # Methods that DO prune (sparsity is meaningful). Others are flat at sparsity 0.
-PRUNE_METHODS = {"wanda", "sparsegpt", "jsq-wo", "slim", "wanda-awq", "wanda-sinq", "cobalt", "cobalt-awq",
-                 "cobaltmask-sgpt", "sgptmask-cobalt", "cobalt-noobs"}
+PRUNE_METHODS = {"wanda", "sparsegpt", "jsq-wo", "slim", "wanda-awq", "wanda-sinq", "cobalt", "cobalt-awq", "cobalt-sinq", "cobalt-sinq", "cobalt-seq", "cobalt-seqfix", "cobalt-seqfix-awclip", "cobalt-ec", "cobalt-ecfix",
+                 "cobalt-floor", "wanda-floor", "cobalt-exact", "cobalt-span", "wanda-span", "cobalt-perhead", "cobalt-cond", "cobalt-spectral", "cobalt-specblend",
+                 "cobaltmask-sgpt", "sgptmask-cobalt", "cobalt-noobs",
+                 "cobalt-repack", "cobalt-eout", "cobalt-compand", "cobalt-binc", "cobalt-bincg",
+                 "cobalt-awclip", "cobalt-awclipz", "cobalt-gridmask", "cobalt-gridmask-awclip",
+                 "wanda-awq-repack", "wanda-sinq-repack", "wanda-awq-binc", "wanda-sinq-binc", "wanda-awq-awclipz", "wanda-sinq-awclipz", "wanda-awq-awclip", "wanda-sinq-awclip"}
 # Methods whose *weights* stay fp16 (bits axis is N/A -> recorded as 16).
 FP16_WEIGHT_METHODS = {"fp16", "wanda"}
 ALL_METHODS = ["fp16", "awq", "sinq", "wanda", "sparsegpt", "jsq-wo", "slim",
-               "wanda-awq", "wanda-sinq", "cobalt", "cobalt-awq",
-               "cobaltmask-sgpt", "sgptmask-cobalt", "cobalt-noobs"]
+               "wanda-awq", "wanda-sinq", "cobalt", "cobalt-awq", "cobalt-sinq", "cobalt-seq", "cobalt-seqfix", "cobalt-seqfix-awclip", "cobalt-ec", "cobalt-ecfix",
+               "cobalt-floor", "wanda-floor", "cobalt-exact", "cobalt-span", "wanda-span", "cobalt-perhead", "cobalt-cond", "cobalt-spectral", "cobalt-specblend",
+               "cobaltmask-sgpt", "sgptmask-cobalt", "cobalt-noobs",
+               "cobalt-repack", "cobalt-eout", "cobalt-compand", "cobalt-binc", "cobalt-bincg",
+               "cobalt-awclip", "cobalt-awclipz", "cobalt-gridmask", "cobalt-gridmask-awclip",
+               "wanda-awq-repack", "wanda-sinq-repack", "wanda-awq-binc", "wanda-sinq-binc", "wanda-awq-awclipz", "wanda-sinq-awclipz", "wanda-awq-awclip", "wanda-sinq-awclip"]
 
 CSV_FIELDS = ["timestamp", "model", "method", "bits", "sparsity", "hp",
               "task", "metric", "value", "correct", "total", "seconds", "error"]
@@ -77,20 +85,30 @@ def read_done_tasks(csv_path, method, bits, sparsity, hp=""):
     Rows written before the hp axis existed have an empty `hp`; a caller asking for
     hp="" still matches them, so legacy CSVs resume cleanly."""
     if not os.path.exists(csv_path):
-        return set()
+        return set
     sp_s, b_s = _canon(sparsity, bits)
-    done = set()
+    done = set
     try:
         with open(csv_path, "r", newline="") as f:
             for r in csv.DictReader(f):
                 if (r.get("model") == MODEL and r.get("method") == method
                         and r.get("bits") == b_s and r.get("sparsity") == sp_s
                         and (r.get("hp") or "") == hp
-                        and not (r.get("error") or "").strip()):
+                        and not (r.get("error") or "").strip):
                     done.add(r.get("task"))
     except Exception:
-        return set()
+        return set
     return done
+
+
+def _is_transient(e):
+    """CUDA OOM on this SHARED, MIG-sliced box is a placement accident, not a property of the cell:
+    another project's job (or a second dispatcher) grabbed the slice first. Writing a FAILED row for it
+    would mark the cell SETTLED and silently drop it from the grid forever. Re-raise instead, so the
+    process exits non-zero and the dispatcher requeues it (its documented transient-failure path)."""
+    if isinstance(e, torch.cuda.OutOfMemoryError):
+        return True
+    return "CUDA out of memory" in str(e) or "CUDA error: out of memory" in str(e)
 
 
 def read_attempted_tasks(csv_path, method, bits, sparsity, hp=""):
@@ -99,9 +117,9 @@ def read_attempted_tasks(csv_path, method, bits, sparsity, hp=""):
     The dispatcher uses this (not read_done_tasks) to decide a cell is finished, so a
     deterministic build failure that wrote FAILED rows is not retried forever."""
     if not os.path.exists(csv_path):
-        return set()
+        return set
     sp_s, b_s = _canon(sparsity, bits)
-    seen = set()
+    seen = set
     try:
         with open(csv_path, "r", newline="") as f:
             for r in csv.DictReader(f):
@@ -110,7 +128,7 @@ def read_attempted_tasks(csv_path, method, bits, sparsity, hp=""):
                         and (r.get("hp") or "") == hp):
                     seen.add(r.get("task"))
     except Exception:
-        return set()
+        return set
     return seen
 
 
@@ -118,20 +136,20 @@ def append_rows(csv_path, rows):
     """Append rows (list of dicts) under an exclusive flock; write header if new."""
     os.makedirs(os.path.dirname(csv_path) or ".", exist_ok=True)
     with open(csv_path, "a+", newline="") as f:
-        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+        fcntl.flock(f.fileno, fcntl.LOCK_EX)
         try:
             f.seek(0)
-            has_header = f.readline().strip().startswith("timestamp")
+            has_header = f.readline.strip.startswith("timestamp")
             f.seek(0, 2)
             w = csv.DictWriter(f, fieldnames=CSV_FIELDS, extrasaction="ignore")
             if not has_header:
-                w.writeheader()
+                w.writeheader
             for row in rows:
                 w.writerow(row)
-            f.flush()
-            os.fsync(f.fileno())
+            f.flush
+            os.fsync(f.fileno)
         finally:
-            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+            fcntl.flock(f.fileno, fcntl.LOCK_UN)
 
 
 def _row(method, bits, sparsity, task, metric, value, correct="", total="",
@@ -157,7 +175,7 @@ def model_tag(model=None):
 def ppl_cache_path(cache_dir, task, seq, n):
     # Keyed by model: Llama and gemma use different tokenizers, so their tokenized
     # PPL tensors MUST NOT collide even if they share a cache dir.
-    return os.path.join(cache_dir, f"{task}_{model_tag()}_s{seq}_n{n}.pt")
+    return os.path.join(cache_dir, f"{task}_{model_tag}_s{seq}_n{n}.pt")
 
 
 def get_ppl_test(tok, task, ppl_windows, c4_windows, cache_dir):
@@ -188,8 +206,8 @@ def _cobalt_balanced_prune_mask(W, H, sparsity, col_exp=0.5):
     K, N = W.shape
     if sparsity <= 0.0:
         return torch.zeros_like(W, dtype=torch.bool)
-    act = torch.diag(H).clamp(min=0).sqrt()               # [N] ∝ ||X_j||
-    imp = W.abs() * act.view(1, -1)
+    act = torch.diag(H).clamp(min=0).sqrt               # [N] ∝ ||X_j||
+    imp = W.abs * act.view(1, -1)
     kr, kc = int(N * sparsity), int(K * sparsity)
     if kr > 0:                                            # row self-normalization
         qr = torch.kthvalue(imp, kr, dim=1, keepdim=True).values.clamp(min=1e-30)
@@ -205,7 +223,8 @@ def _cobalt_balanced_prune_mask(W, H, sparsity, col_exp=0.5):
 
 def build_model(method, sparsity, bits, tok, cobalt_group_size=None,
                 cobalt_beta=0.5, cobalt_norm="acol", cobalt_per_row=False,
-                percdamp=0.01, blocksize=128, jsq_rho=2.1, jsq_clip_h=0.01):
+                percdamp=0.01, blocksize=128, jsq_rho=2.1, jsq_clip_h=0.01,
+                cobalt_floor_frac=0.0, cobalt_protect=0.0, cobalt_adapt=0.0):
     """Load gemma-2b fp16 and apply the requested compression. Returns model on DEV.
 
     The bpw-preserving TUNED knobs (cobalt β, sparsegpt percdamp/blocksize, jsq-wo
@@ -215,7 +234,7 @@ def build_model(method, sparsity, bits, tok, cobalt_group_size=None,
                                   seq_len=bs.EVAL_CONFIG["calibration_seq_len"],
                                   dataset_key="wikitext2")
     torch.manual_seed(0)
-    if torch.cuda.is_available():
+    if torch.cuda.is_available:
         torch.cuda.manual_seed_all(0)
     model = AutoModelForCausalLM.from_pretrained(name, torch_dtype=torch.float16,
                                                  device_map="cpu", low_cpu_mem_usage=True)
@@ -244,10 +263,207 @@ def build_model(method, sparsity, bits, tok, cobalt_group_size=None,
         model = bs.apply_wanda_awq_quantization(model, cal, bits, float(sparsity), DEV)
     elif method == "wanda-sinq":
         model = bs.apply_wanda_sinq_quantization(model, cal, bits, float(sparsity), DEV)
+    elif method == "cobalt-sinq":
+        # MASK-isolation arm (#36): CoBALT balanced mask + the BASELINE's SINQ quantizer (matched quant) ->
+        # isolates the MASK from the quantizer. vs wanda-sinq = pure balance-vs-wanda under identical SINQ.
+        model = bs.apply_wanda_sinq_quantization(model, cal, bits, float(sparsity), DEV,
+                                                 balanced=True, cobalt_beta=float(cobalt_beta),
+                                                 floor_frac=float(cobalt_floor_frac), protect=float(cobalt_protect), adapt=float(cobalt_adapt))
+    elif method == "wanda-awq-repack":
+        # math4 fairness: AWQ+Wanda with the repacking storage lever (group-128).
+        model = bs.apply_wanda_awq_quantization(model, cal, bits, float(sparsity), DEV, repack=True)
+    elif method == "wanda-sinq-repack":
+        # math4 fairness: SINQ+Wanda with the repacking storage lever (group-128).
+        model = bs.apply_wanda_sinq_quantization(model, cal, bits, float(sparsity), DEV, repack=True)
+    elif method == "wanda-awq-binc":
+        # fairness: give the mask-agnostic bin-center survivor lever to the AWQ baseline
+        # (its OWN awq normalization). bpw-identical to wanda-awq. See src/eout_quant.py.
+        model = bs.apply_wanda_awq_quantization(model, cal, bits, float(sparsity), DEV, binc=True)
+    elif method == "wanda-sinq-binc":
+        # fairness: give the bin-center survivor lever to the SINQ baseline (its own dual norm).
+        model = bs.apply_wanda_sinq_quantization(model, cal, bits, float(sparsity), DEV, binc=True)
+    elif method == "wanda-awq-awclip":
+        # FAIRNESS (attempt-7): give the mask-agnostic awclip SCALE lever to AWQ (its own norm).
+        model = bs.apply_wanda_awq_quantization(model, cal, bits, float(sparsity), DEV, awclip=True)
+    elif method == "wanda-sinq-awclip":
+        # FAIRNESS (attempt-7): give the awclip SCALE lever to SINQ (its own dual norm).
+        model = bs.apply_wanda_sinq_quantization(model, cal, bits, float(sparsity), DEV, awclip=True)
+    elif method == "wanda-awq-awclipz":
+        # FAIRNESS (attempt-7): give the mask-agnostic awclipz scale+zero lever to the AWQ
+        # baseline on ITS OWN normalization. bpw-identical. The critic's required matched test.
+        model = bs.apply_wanda_awq_quantization(model, cal, bits, float(sparsity), DEV, awclipz=True)
+    elif method == "wanda-sinq-awclipz":
+        # FAIRNESS (attempt-7): give the awclipz lever to the SINQ baseline (its own dual norm).
+        model = bs.apply_wanda_sinq_quantization(model, cal, bits, float(sparsity), DEV, awclipz=True)
+    elif method in ("cobalt-seq", "cobalt-seqfix", "cobalt-seqfix-awclip"):
+        # CROSS-LAYER v2 : sequential pass, inputs from the COMPRESSED prefix, per-block beta
+        # chosen by the PROPAGATED block-output error (argmin over --seq-betas). cobalt-seqfix = same
+        # sequential inputs at the single fixed --cobalt-beta (attribution: prefix compensation alone).
+        import cobalt_seq as cs
+        _betas = ([float(cobalt_beta)] if method.startswith("cobalt-seqfix")
+                  else [float(b) for b in os.environ.get("SEQ_BETAS", "0,0.3,0.5,0.7,1").split(",")])
+        _q = "awclip" if method.endswith("-awclip") else "rtn"
+        model, _b, _r = cs.apply_cobalt_seq(model, cal, bits, float(sparsity), DEV, betas=_betas,
+                                            group_size=(cobalt_group_size or 128), norm="col", quantizer=_q,
+                                            log_path=os.path.join(_ROOT, "results", "cobalt_seq", "beta_schedule.tsv"),
+                                            tag=f"{MODEL}\t{method}")
+    elif method in ("cobalt-ec", "cobalt-ecfix"):
+        # SALVAGE v2 : error-CORRECTING sequential CoBALT. Per block, ridge-fit W to map the
+        # compressed-prefix input to the DENSE output (strength alpha), then the unchanged mask/OBS/quant.
+        # cobalt-ec: alpha in {0,0.5,1} per block chosen by HELD-OUT (ptb) propagated error.
+        # cobalt-ecfix: alpha=1 everywhere, no selection (attribution: is the held-out choice needed?).
+        import cobalt_seq as cs
+        _alphas = [float(a) for a in os.environ.get("EC_ALPHAS", "0,1").split(",")]
+        _lams = [float(a) for a in os.environ.get("EC_LAMS", "1,3,10").split(",")]
+        _ho = None
+        if method == "cobalt-ec":
+            _ho = bs.get_calibration_data(tok, n_samples=8, seq_len=bs.EVAL_CONFIG["calibration_seq_len"],
+                                          dataset_key="ptb")
+        else:
+            _alphas = [1.0]
+        model, _c, _r = cs.apply_cobalt_ec(model, cal, bits, float(sparsity), DEV, alphas=_alphas,
+                                           betas=[float(cobalt_beta)], heldout_data=_ho,
+                                           group_size=(cobalt_group_size or 128), norm="col", lams=_lams,
+                                           log_path=os.path.join(_ROOT, "results", "cobalt_seq", "ec_schedule.tsv"),
+                                           tag=f"{MODEL}\t{method}")
     elif method == "cobalt":
         model, _ = ns.apply_wanda_obs_rtn(model, cal, bits, sbt, DEV, norm="col",
                                           mask_mode="balanced", dense_norm="col",
                                           col_balance_exp=float(cobalt_beta), group_size=cobalt_group_size)
+    elif method == "cobalt-floor":
+        # NOVEL MASK (attempt-11 #21): CoBALT balanced mask + HARD column-degree FLOOR that rescues the
+        # OBS-uncompensable DEAD columns soft-beta leaves (MEASURED). IDENTICAL bpw to `cobalt` (global
+        # survivor count held exactly constant by the promote/demote swap). One-shot, non-iterative.
+        model, _ = ns.apply_wanda_obs_rtn(model, cal, bits, sbt, DEV, norm="col",
+                                          mask_mode="balanced_floor", dense_norm="col",
+                                          col_balance_exp=float(cobalt_beta), group_size=cobalt_group_size,
+                                          floor_frac=float(cobalt_floor_frac))
+    elif method == "cobalt-cond":
+        # NOVEL MASK (#28): non-separable conditioning-modulated column balance. Same bpw as cobalt.
+        model, _ = ns.apply_wanda_obs_rtn(model, cal, bits, sbt, DEV, norm="col",
+                                          mask_mode="balanced_cond", dense_norm="col",
+                                          col_balance_exp=float(cobalt_beta), group_size=cobalt_group_size)
+    elif method == "cobalt-perhead":
+        # NOVEL MASK (#30): CoBALT balanced + per-HEAD balance on o_proj (orthogonal granularity). Same bpw.
+        model, _ = ns.apply_wanda_obs_rtn(model, cal, bits, sbt, DEV, norm="col",
+                                          mask_mode="balanced_perhead", dense_norm="col",
+                                          col_balance_exp=float(cobalt_beta), group_size=cobalt_group_size)
+    elif method == "wanda-span":
+        # FAIRNESS CONTROL: spanning weight on plain per-row wanda (no col balance) + OBS + RTN.
+        model, _ = ns.apply_wanda_obs_rtn(model, cal, bits, sbt, DEV, norm="col",
+                                          mask_mode="wanda_span", dense_norm="col",
+                                          col_balance_exp=float(cobalt_beta), group_size=cobalt_group_size)
+    elif method in ("cobalt-spectral", "cobalt-specblend"):
+        # NOVEL MASK (#42): spectral-subspace-preserving survivor set (Jaccard 0.30 vs balanced = genuinely
+        # distinct). specblend = geometric mean with magnitude importance. Same bpw as cobalt.
+        mm = "balanced_spectral" if method == "cobalt-spectral" else "balanced_specblend"
+        model, _ = ns.apply_wanda_obs_rtn(model, cal, bits, sbt, DEV, norm="col",
+                                          mask_mode=mm, dense_norm="col",
+                                          col_balance_exp=float(cobalt_beta), group_size=cobalt_group_size)
+    elif method == "cobalt-span":
+        # NOVEL MASK (#25): softer column balance (beta) + UNIQUE-variance spanning column weight for a
+        # well-conditioned survivor set. Same bpw as cobalt. beta passed via --cobalt-beta (deploy 0.4).
+        model, _ = ns.apply_wanda_obs_rtn(model, cal, bits, sbt, DEV, norm="col",
+                                          mask_mode="balanced_span", dense_norm="col",
+                                          col_balance_exp=float(cobalt_beta), group_size=cobalt_group_size)
+    elif method == "cobalt-exact":
+        # NOVEL MASK (attempt-11 #18): EXACT doubly-degree-balanced support -- the HARD form of CoBALT's
+        # column balance (keep-rate CV ~4x lower), one-shot greedy, retains magnitude. Same bpw as cobalt.
+        model, _ = ns.apply_wanda_obs_rtn(model, cal, bits, sbt, DEV, norm="col",
+                                          mask_mode="balanced_exact", dense_norm="col",
+                                          col_balance_exp=float(cobalt_beta), group_size=cobalt_group_size)
+    elif method == "wanda-floor":
+        # S4 ATTRIBUTION control: the SAME column floor on plain per-row Wanda's mask/importance (no
+        # column balance) -> isolates whether the FLOOR is a universal anti-starvation lever or needs
+        # CoBALT's balanced base. Same bpw.
+        model, _ = ns.apply_wanda_obs_rtn(model, cal, bits, sbt, DEV, norm="col",
+                                          mask_mode="wanda_floor", dense_norm="col",
+                                          col_balance_exp=float(cobalt_beta), group_size=cobalt_group_size,
+                                          floor_frac=float(cobalt_floor_frac))
+    elif method in ("cobalt-repack", "cobalt-eout"):
+        # math4 arms: IDENTICAL pipeline to `cobalt` (same balanced mask, same OBS,
+        # same col-norm, same group-RTN accounting) — only the survivor quantization
+        # step differs, at strictly equal total bits (bitmap included).
+        #   cobalt-repack: survivor-only codes at budget width b', min-max hull grids
+        #   cobalt-eout:   measured-argmin selector incl. E_out code descent (>= never
+        #                  worse than deployed RTN on the calibration objective)
+        arm = "repack" if method == "cobalt-repack" else "eout"
+        mlog = os.path.join(_ROOT, "results", "eout_margins", "margins.csv")
+        model, _ = ns.apply_wanda_obs_rtn(model, cal, bits, sbt, DEV, norm="col",
+                                          mask_mode="balanced", dense_norm="col",
+                                          col_balance_exp=float(cobalt_beta), group_size=cobalt_group_size,
+                                          quantizer=arm, margin_log=mlog,
+                                          margin_ctx={"model": MODEL})
+    elif method == "cobalt-compand":
+        # NOVEL survivor quantizer: IDENTICAL CoBALT pipeline (same balanced mask,
+        # same OBS, same col-norm, same uniform bit-width & group) — only the
+        # survivor CODING changes to a power-companded grid fit to CoBALT's
+        # post-OBS survivor shape (1 gamma/tensor; storage = same 2 vals/group as
+        # RTN). Not repack (uniform b), not multiprecision. See src/eout_quant.py.
+        mlog = os.path.join(_ROOT, "results", "compand_margins", "margins.csv")
+        model, _ = ns.apply_wanda_obs_rtn(model, cal, bits, sbt, DEV, norm="col",
+                                          mask_mode="balanced", dense_norm="col",
+                                          col_balance_exp=float(cobalt_beta), group_size=cobalt_group_size,
+                                          quantizer="compand", margin_log=mlog,
+                                          margin_ctx={"model": MODEL})
+    elif method == "cobalt-binc":
+        # NOVEL survivor quantizer: IDENTICAL CoBALT pipeline (same balanced mask,
+        # same OBS, same col-norm, same uniform bit-width & group) — only the survivor
+        # CODING changes to a bin-CENTERED uniform grid (alpha-scaled hull) fit to
+        # CoBALT's MEASURED near-uniform survivor law. Storage = same 2 vals/group as
+        # RTN => bpw-identical to `cobalt`. Not repack, not multiprecision, not companding.
+        mlog = os.path.join(_ROOT, "results", "binc_margins", "margins.csv")
+        model, _ = ns.apply_wanda_obs_rtn(model, cal, bits, sbt, DEV, norm="col",
+                                          mask_mode="balanced", dense_norm="col",
+                                          col_balance_exp=float(cobalt_beta), group_size=cobalt_group_size,
+                                          quantizer="binc", margin_log=mlog,
+                                          margin_ctx={"model": MODEL})
+    elif method == "cobalt-awclip":
+        # NOVEL (attempt-7): IDENTICAL CoBALT pipeline (same balanced mask, OBS, col-norm,
+        # uniform bit-width & group) — only the per-group SCALE is chosen by activation-
+        # WEIGHTED output error instead of max-abs (the axis every prior arm left at RTN's
+        # max-abs). Same dense (scale,zero) decoder => bpw-identical to `cobalt`. Grounded in
+        # the measurement that CoBALT's mask keeps the group extreme in a low-||X|| column.
+        mlog = os.path.join(_ROOT, "results", "awclip_margins", "margins.csv")
+        model, _ = ns.apply_wanda_obs_rtn(model, cal, bits, sbt, DEV, norm="col",
+                                          mask_mode="balanced", dense_norm="col",
+                                          col_balance_exp=float(cobalt_beta), group_size=cobalt_group_size,
+                                          quantizer="awclip", margin_log=mlog,
+                                          margin_ctx={"model": MODEL})
+    elif method == "cobalt-awclipz":
+        # NOVEL (attempt-7): joint per-group (SCALE, ZERO) output-weighted grid — awclip + the
+        # zero-point DOF. Same dense (scale,zero) decoder => bpw-identical to `cobalt`.
+        mlog = os.path.join(_ROOT, "results", "awclipz_margins", "margins.csv")
+        model, _ = ns.apply_wanda_obs_rtn(model, cal, bits, sbt, DEV, norm="col",
+                                          mask_mode="balanced", dense_norm="col",
+                                          col_balance_exp=float(cobalt_beta), group_size=cobalt_group_size,
+                                          quantizer="awclipz", margin_log=mlog,
+                                          margin_ctx={"model": MODEL})
+    elif method in ("cobalt-gridmask", "cobalt-gridmask-awclip"):
+        # NOVEL (fresh commission): the MASK is grid-aware. IDENTICAL CoBALT pipeline (same balanced
+        # importance+beta, OBS, col-norm, uniform bit-width & group) EXCEPT the support is swapped by
+        # a deterministic global GRID rule (nosink.grid_balanced_mask_and_obs): prune each group's
+        # low-energy scale-setter, promote an interior high-energy candidate => tighter group-RTN
+        # hull => finer step for group-mates. Global sparsity unchanged; NOT repack/multiprecision.
+        # MEASURED CoBALT-specific + awclip-orthogonal at 2-BIT on gemma+tinyllama (src/probe_gridmask,
+        # results/gridmask/); DO NOT use >=3-bit (survivor-loss cost exceeds granularity gain there).
+        # -awclip variant stacks the awclip survivor SCALE lever on the grid support (orthogonality).
+        arm = "awclip" if method == "cobalt-gridmask-awclip" else "rtn"
+        mlog = os.path.join(_ROOT, "results", "gridmask_margins", "margins.csv")
+        model, _ = ns.apply_wanda_obs_rtn(model, cal, bits, sbt, DEV, norm="col",
+                                          mask_mode="grid_balanced", dense_norm="col",
+                                          col_balance_exp=float(cobalt_beta), group_size=cobalt_group_size,
+                                          quantizer=arm, margin_log=mlog,
+                                          margin_ctx={"model": MODEL})
+    elif method == "cobalt-bincg":
+        # ACTIVATION-GATED binc: per-group endpoint-vs-bincenter by the extreme survivor's column
+        # activation (deterministic global rule; targets binc's regime-contingency). bpw == cobalt.
+        mlog = os.path.join(_ROOT, "results", "bincg_margins", "margins.csv")
+        model, _ = ns.apply_wanda_obs_rtn(model, cal, bits, sbt, DEV, norm="col",
+                                          mask_mode="balanced", dense_norm="col",
+                                          col_balance_exp=float(cobalt_beta), group_size=cobalt_group_size,
+                                          quantizer="bincg", margin_log=mlog,
+                                          margin_ctx={"model": MODEL})
     elif method == "cobalt-noobs":
         # ABLATION (Factor C OFF): IDENTICAL to `cobalt` except the OBS error-compensation step is
         # dropped (no_obs=True). Same balanced mask (byte-identical at a given β), same col-norm, same
@@ -282,15 +498,15 @@ def build_model(method, sparsity, bits, tok, cobalt_group_size=None,
         raise ValueError(f"unknown method {method}")
 
     bs.move_final_layers_to_device(model, DEV)
-    model.eval()
+    model.eval
     model.seqlen = bs.EVAL_CONFIG["seq_len"]
     return model
 
 
 # -------------------------------------------------------------------------- main
-def main():
+def main:
     global MODEL
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser
     ap.add_argument("--model", default=MODEL, help="model key in benchmark_suite.MODELS")
     ap.add_argument("--method", required=True, choices=ALL_METHODS)
     ap.add_argument("--sparsity", type=float, default=0.0)
@@ -306,6 +522,12 @@ def main():
                     help="override CoBALT RTN group size (default 64; use 128 to MATCH baselines' bpw)")
     ap.add_argument("--cobalt-beta", type=float, default=0.5,
                     help="column-balance strength (method=cobalt tuned β; also cobalt-awq)")
+    ap.add_argument("--cobalt-adapt", type=float, default=0.0,
+                    help="cobalt-sinq: adaptive per-matrix beta from demotion signal (slope; #39)")
+    ap.add_argument("--cobalt-protect", type=float, default=0.0,
+                    help="cobalt-sinq: saliency-protected fraction of survivor budget (#38)")
+    ap.add_argument("--cobalt-floor-frac", type=float, default=0.25,
+                    help="cobalt-floor/wanda-floor: hard per-column survivor floor = frac*(1-sp)*K")
     ap.add_argument("--hp", default="", help="hp label written to the CSV (dispatcher-owned; e.g. 'beta=0.5')")
     ap.add_argument("--sgpt-percdamp", type=float, default=0.01, help="sparsegpt Hessian damping (tuned)")
     ap.add_argument("--sgpt-blocksize", type=int, default=128, help="sparsegpt OBS block width (tuned)")
@@ -316,12 +538,15 @@ def main():
     ap.add_argument("--cobalt-per-row", action="store_true",
                     help="cobalt-awq: use the GENTLE balance variant (single per-col reweight + exact "
                          "per-row threshold; unimpeachably non-Sinkhorn) instead of global-topk balance")
+    ap.add_argument("--nm", default=None,
+                    help="N:M semi-structured sparsity, e.g. '2:4' (forces sparsity=1-n/m; routes every "
+                         "arm's mask through top-n-per-m selection; hp label gets 'nm=N:M')")
     ap.add_argument("--force-true-bits", action="store_true",
                     help="neutralize get_adaptive_nbits so SINQ/Wanda+SINQ stay at true target bits "
                          "(matched-config fix for models where the adaptive bump fires, e.g. Qwen2.5-3B)")
     ap.add_argument("--ppl-cache-dir",
                     default=os.path.join(_ROOT, "results", "benchmark_camera", "ppl_cache"))
-    args = ap.parse_args()
+    args = ap.parse_args
 
     MODEL = args.model
     if MODEL not in bs.MODELS:
@@ -335,13 +560,19 @@ def main():
         print("[cell] --force-true-bits: get_adaptive_nbits neutralized (true bits for all arms)", flush=True)
 
     method = args.method
+    if args.nm:
+        n_, m_ = (int(v) for v in args.nm.split(":"))
+        ns.NM_PATTERN = (n_, m_); bs.NM_PATTERN = (n_, m_)
+        args.sparsity = 1.0 - n_ / m_
+        args.hp = f"nm={args.nm}" + (f",{args.hp}" if args.hp else "")
+        print(f"[cell] --nm {args.nm}: N:M masks for all arms, sparsity={args.sparsity:g}", flush=True)
     # Normalize the (sparsity, bits) that this method is actually DEFINED at.
     sparsity = args.sparsity if method in PRUNE_METHODS else 0.0
     bits = 16 if method in FP16_WEIGHT_METHODS else args.bits
     sp_s, b_s = _canon(sparsity, bits)
 
-    ppl_tasks = [t.strip() for t in args.ppl_tasks.split(",") if t.strip()]
-    ds_tasks = [t.strip() for t in args.ds_tasks.split(",") if t.strip()]
+    ppl_tasks = [t.strip for t in args.ppl_tasks.split(",") if t.strip]
+    ds_tasks = [t.strip for t in args.ds_tasks.split(",") if t.strip]
     all_tasks = ppl_tasks + ds_tasks
 
     done = read_done_tasks(args.csv, method, bits, sparsity, args.hp)
@@ -358,14 +589,17 @@ def main():
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
 
-    t_build = time.time()
+    t_build = time.time
     try:
         model = build_model(method, sparsity, bits, tok, cobalt_group_size=args.cobalt_group_size,
                             cobalt_beta=args.cobalt_beta, cobalt_norm=args.cobalt_norm,
                             cobalt_per_row=args.cobalt_per_row,
                             percdamp=args.sgpt_percdamp, blocksize=args.sgpt_blocksize,
-                            jsq_rho=args.jsq_rho, jsq_clip_h=args.jsq_clip_h)
+                            jsq_rho=args.jsq_rho, jsq_clip_h=args.jsq_clip_h,
+                            cobalt_floor_frac=args.cobalt_floor_frac, cobalt_protect=args.cobalt_protect, cobalt_adapt=args.cobalt_adapt)
     except Exception as e:
+        if _is_transient(e):
+            raise                                    # OOM = slice contention -> requeue, do NOT settle
         # A DETERMINISTIC build failure (e.g. SparseGPT non-PD Cholesky at pd=0.001 on the wide
         # gemma FFN, seeded calibration) would crash the process and be requeued forever. Instead
         # write an honest FAILED row per remaining task and exit 0 so the dispatcher marks the cell
@@ -373,31 +607,33 @@ def main():
         for task in todo:
             metric = "perplexity" if task in ppl_tasks else "accuracy"
             append_rows(args.csv, [_row(method, bits, sparsity, task, metric, "",
-                                        seconds=time.time() - t_build,
+                                        seconds=time.time - t_build,
                                         error=f"FAILED:build:{type(e).__name__}: {e}", hp=args.hp)])
         print(f"[FAIL] {tag} build: {type(e).__name__}: {e}", flush=True)
         print(f"CELL_DONE {tag} (build failed -> FAILED rows written)", flush=True)
         return
-    print(f"[cell] built in {time.time()-t_build:.1f}s", flush=True)
+    print(f"[cell] built in {time.time-t_build:.1f}s", flush=True)
 
     # ---- PPL tasks ----
     for task in ppl_tasks:
         if task in done:
             continue
-        t0 = time.time()
+        t0 = time.time
         try:
             test = get_ppl_test(tok, task, args.ppl_windows, args.c4_windows, args.ppl_cache_dir)
             ppl = bs.evaluate_perplexity(model, test, DEV)
-            dt = time.time() - t0
+            dt = time.time - t0
             append_rows(args.csv, [_row(method, bits, sparsity, task, "perplexity",
                                         f"{ppl:.4f}", total=test.shape[0], seconds=dt, hp=args.hp)])
             print(f"RESULT {tag} task={task} ppl={ppl:.4f} n={test.shape[0]} ({dt:.1f}s)", flush=True)
         except Exception as e:
-            dt = time.time() - t0
+            if _is_transient(e):
+                raise                                # OOM = slice contention -> requeue, do NOT settle
+            dt = time.time - t0
             append_rows(args.csv, [_row(method, bits, sparsity, task, "perplexity", "",
                                         seconds=dt, error=f"FAILED:{type(e).__name__}: {e}", hp=args.hp)])
             print(f"[FAIL] {tag} task={task}: {type(e).__name__}: {e}", flush=True)
-        gc.collect(); torch.cuda.empty_cache()
+        gc.collect; torch.cuda.empty_cache
 
     # ---- downstream tasks ----
     from downstream import eval_arc, eval_hellaswag, eval_piqa, eval_winogrande  # noqa
@@ -408,7 +644,7 @@ def main():
     for task in ds_tasks:
         if task in done:
             continue
-        t0 = time.time()
+        t0 = time.time
         try:
             if task in ("arc_easy", "arc_challenge"):
                 if not _arc_cache:
@@ -418,22 +654,24 @@ def main():
                 m = _arc_cache.get(key, {})
             else:
                 m = DS_ADAPTERS[task](model, tok, DEV, limit=args.limit, seqlen=seqlen, verbose=False)
-            dt = time.time() - t0
+            dt = time.time - t0
             append_rows(args.csv, [_row(method, bits, sparsity, task, "accuracy",
                                         f"{m.get('accuracy'):.4f}", correct=m.get("correct", ""),
                                         total=m.get("total", ""), seconds=dt, hp=args.hp)])
             print(f"RESULT {tag} task={task} acc={m.get('accuracy'):.4f} "
                   f"({m.get('correct')}/{m.get('total')}) ({dt:.1f}s)", flush=True)
         except Exception as e:
-            dt = time.time() - t0
+            if _is_transient(e):
+                raise                                # OOM = slice contention -> requeue, do NOT settle
+            dt = time.time - t0
             append_rows(args.csv, [_row(method, bits, sparsity, task, "accuracy", "",
                                         seconds=dt, error=f"FAILED:{type(e).__name__}: {e}", hp=args.hp)])
             print(f"[FAIL] {tag} task={task}: {type(e).__name__}: {e}", flush=True)
         model.to(DEV)  # defensive: some adapters can move the model
-        gc.collect(); torch.cuda.empty_cache()
+        gc.collect; torch.cuda.empty_cache
 
     print(f"CELL_DONE {tag}", flush=True)
 
 
 if __name__ == "__main__":
-    main()
+    main
