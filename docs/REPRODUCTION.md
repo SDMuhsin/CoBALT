@@ -7,6 +7,39 @@ Read the whole of §1 before starting: §1.3 in particular will save you an afte
 
 ---
 
+## 0. If you were sent a prebuilt package, skip stages 1 and 2
+
+A prebuilt package is a directory containing `model/`, `src/`, `docs/`, `RUN.md` and
+`SHA256SUMS`. **The weights are already built.** You need no Hugging Face checkpoint, no
+calibration data, and none of the hours-long quantization run — stages 1 (§3) and 2 (§4)
+are ours, already done, and nothing on your side re-runs them.
+
+```bash
+cd <package>
+sha256sum -c SHA256SUMS          # optional but cheap; 11 GB transfers do get truncated
+export PYTHONPATH=$PWD/src
+
+python -m prod doctor            # §1.3 -- is the machine ready?
+python -m prod verify   model    # §5   -- ~2 s, no GPU, no kernel build
+python -m prod generate model --prompt "A 54-year-old presents with" -n 64
+python -m prod bench    model --prompt 512 --gen 128 --out bench.json    # §7
+```
+
+`model/` carries `config.json` and the tokenizer alongside the packed weights, so
+**`--config` is never needed** and the package has no external model dependency. The
+recipe is read out of `model/manifest.json`, so an artifact cannot be paired with the
+wrong kernel configuration.
+
+Then read §1 (prerequisites), §5 (what verify proves), §7 (the measurement protocol) and
+§8 (where this design does not win). §3 and §4 are background only — read them to
+understand what produced the weights, not as steps to perform.
+
+This is the path we recommend for reproducing our published numbers: it removes both the
+calibration data and the quantizer from the set of things that could differ between us,
+so a disagreement can only come from the kernel or the hardware.
+
+---
+
 ## 1. Prerequisites
 
 ### 1.1 Hardware
@@ -22,6 +55,19 @@ Our numbers were taken on one **MIG 2g.48gb slice** of an RTX PRO 6000 Blackwell
 Hopper or Blackwell card will run the kernels; the achieved tok/s scales with memory
 bandwidth, since decode is bandwidth-bound.
 
+**A 24 GB card is enough for MedGemma-27B**, with room to spare. The KV term is 0.484 MiB
+per token and is identical for every arm, so for the 11 GB arms:
+
+| context | weights | KV cache | total |
+|---|---|---|---|
+| 2 048 | 10.4 GB | 1.0 GB | 11.4 GB |
+| 4 096 | 10.4 GB | 1.9 GB | 12.3 GB |
+| 16 384 | 10.4 GB | 7.7 GB | 18.1 GB |
+
+Note that **serving needs far less memory than quantizing**. §3 streams a 27B checkpoint
+through a 48 GB slice; if your card is smaller than that, take the prebuilt-package route
+in §0 rather than trying to build the artifact locally.
+
 ### 1.2 Software
 
 ```
@@ -33,9 +79,13 @@ safetensors, numpy
 transformers     only for quantization and the tokenizer helpers
 ```
 
-The CUDA extension is JIT-compiled by `torch.utils.cpp_extension` on first use (about
-30–90 s, cached afterwards in `TORCH_EXTENSIONS_DIR`). There is nothing to `pip install`
-and no build step of your own.
+The CUDA extension is JIT-compiled by `torch.utils.cpp_extension` on first use and cached
+afterwards in `TORCH_EXTENSIONS_DIR`. There is nothing to `pip install` and no build step
+of your own. **Budget 10–20 minutes for that first build**, not seconds: `megakernel.cu`
+is one large, heavily-templated translation unit and nvcc is single-threaded on it. It is
+compiling even though nothing is printed — see the stale-lock warning in §9 for how to
+tell a real compile from a blocked one. Each distinct recipe, and each batch size, gets
+its own build directory and so its own first build.
 
 ### 1.3 Check the machine before anything else
 
@@ -57,6 +107,15 @@ Two that bite people repeatedly:
 * **Cache directories on a small home volume.** The JIT build cache, the CUDA cache and
   the HF cache all land under `$HOME` by default. Point `COBALT_CACHE` (and `HF_HOME`,
   `TMPDIR`) at a large volume if your home quota is tight.
+
+**What `doctor` does not check.** It validates the toolchain and the device: compute
+capability, nvcc's presence, ninja, cooperative launch. It does *not* check that your
+nvcc is new enough to emit code for the compute capability it just detected, nor that
+free VRAM exceeds the artifact, nor that any input file exists. So a clean
+`"blockers": []` means "the machine looks sane", not "the next command will work" — and
+an `Unsupported gpu architecture 'compute_XXa'` from nvcc is a toolkit too old for your
+card, which doctor will have reported as fine. Match your CUDA toolkit to your GPU
+generation, not merely to torch.
 
 You can also check the package itself, which needs no GPU and no artifact:
 
@@ -155,10 +214,23 @@ step 3, and — for `blk1632_b6_oproj4` — the code width.
 
 ### Calibration data
 
+> **This will stop you on a fresh clone.** The recipes pin
+> `results/accel4bit/calib_ultrachat_512x2048.txt`, and `results/` is excluded by
+> `.gitignore` — so the file is **not present in the repository**, and stage 1 fails on it
+> with `FileNotFoundError` before any work is done. `doctor` does not check for it. Pick
+> one of:
+>
+> * `--calib wikitext2` — built in, downloads itself, needs no file. Easiest, but it is
+>   *not* what our published arms were calibrated on, so expect small quality differences.
+> * `--calib-file <your own text>` — one sample per blank-line-separated block. **Best
+>   choice for deployment:** calibrate on traffic that resembles yours.
+> * Regenerate ours with `src/accel4bit_dump_calib.py`, which pulls
+>   ultrachat_200k/train_sft and packs it identically (seed 42, 2048 tokens).
+>
+> Or avoid the question entirely and ask us for a prebuilt package (§0).
+
 The recipes point at `results/accel4bit/calib_ultrachat_512x2048.txt` (512 sequences from
-ultrachat_200k/train_sft, seed 42, packed to 2048 tokens; the first 128 are used). That
-file is a research artifact and is not committed. Substitute your own with
-`--calib-file`, or `--calib wikitext2` to use the built-in path. **Calibrate on text that
+ultrachat_200k/train_sft, seed 42, packed to 2048 tokens; the first 128 are used). **Calibrate on text that
 resembles your deployment traffic** — the quantizer's compensation step fits the input
 covariance, and a mismatch shows up as a quality loss no amount of kernel work recovers.
 
@@ -348,6 +420,19 @@ Being straight about the limits:
 ---
 
 ## 9. Troubleshooting
+
+> **The one that wastes the most time: a stale build lock looks exactly like a hang.**
+> If a JIT build is interrupted — Ctrl-C, a timeout, a killed shell — torch leaves a
+> zero-byte `lock` file in its build directory. The *next* run then blocks on that baton
+> forever: the process is alive, the log is silent, and it holds **zero GPU memory**, so
+> `nvidia-smi` shows nothing at all. It is indistinguishable from a slow compile.
+>
+> ```bash
+> find "$TORCH_EXTENSIONS_DIR" -name lock -delete     # then re-run
+> ```
+>
+> The tell is a live PID with no `nvcc` child and no new `.o` files. We have hit this
+> ourselves more than once, including while preparing this guide.
 
 | symptom | cause and fix |
 |---|---|

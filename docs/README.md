@@ -5,9 +5,26 @@ quantization pipeline that produces the weights they read.
 
 | document | read it for |
 |---|---|
-| [REPRODUCTION.md](REPRODUCTION.md) | **start here** — set up, build, verify and benchmark the kernels on your own GPU |
+| `RUN.md` (prebuilt packages only) | **start here if you received weights** — the four commands, nothing else |
+| [REPRODUCTION.md](REPRODUCTION.md) | set up, build, verify and benchmark the kernels on your own GPU |
 | [FORMAT.md](FORMAT.md) | the CBK1 weight format: bit layout, bpw accounting, how to write your own reader |
 | [KERNELS.md](KERNELS.md) | how the megakernel is put together, which source does what, what to tune when porting |
+
+## Which of the two paths are you on?
+
+**A — you received a prebuilt package** (a directory with `model/` in it, or a tarball of
+one). The weights are already built: **skip stages 1 and 2 entirely.** You do not need a
+Hugging Face checkpoint, calibration data, or the hours-long quantization run. Read the
+package's `RUN.md`, then [REPRODUCTION.md](REPRODUCTION.md) §1 (prerequisites), §5
+(verify), §6 (serve), §7 (benchmark) and §8 (where this design does not win).
+
+**B — you are building an artifact from a Hugging Face checkpoint yourself.** Read
+[REPRODUCTION.md](REPRODUCTION.md) start to finish. Note §3: the calibration file the
+recipes pin is a research artifact that is **not in this repository**, so stage 1 cannot
+run until you supply calibration text of your own.
+
+Path A is the right one for reproducing our published numbers, because it removes both
+the calibration data and the quantizer from the things that could differ between us.
 
 ## What this is, in one paragraph
 
