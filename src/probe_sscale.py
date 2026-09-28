@@ -35,12 +35,12 @@ def magnitude_mask_and_obs(W, X, sparsity, device):
     """Pure |W| magnitude mask (global top-k), SAME OBS as balanced_mask_and_obs -- the control
     where pruned positions ARE interior (sscale should NOT help)."""
     K = W.shape[0]
-    X = X.float
-    imp = W.abs
+    X = X.float()
+    imp = W.abs()
     mask = ns._threshold_mask(imp, sparsity, scope='global')
     H_inv = compute_hessian_inverse(X, damping=None)
-    H_inv_diag = H_inv.diag
-    W_comp = W.clone
+    H_inv_diag = H_inv.diag()
+    W_comp = W.clone()
     for i in range(K):
         pruned = W[i] * (1.0 - mask[i])
         comp = -H_inv @ (pruned / H_inv_diag)
@@ -49,7 +49,7 @@ def magnitude_mask_and_obs(W, X, sparsity, device):
 
 
 def sscale_quantize(W_norm, mask, nbits, gsize):
-    K, N = W_norm.shape; m = mask.bool; nl = 2 ** nbits - 1
+    K, N = W_norm.shape; m = mask.bool(); nl = 2 ** nbits - 1
     grouped = N > gsize and N % gsize == 0
     if grouped:
         ng = N // gsize; Wg = W_norm.view(K, ng, gsize); Mg = m.view(K, ng, gsize)
@@ -67,7 +67,7 @@ def sscale_quantize(W_norm, mask, nbits, gsize):
 
 def hull_stats(W_norm, mask, gsize):
     """frac of groups with survivor hull strictly inside full hull, and mean surv_range/full_range."""
-    K, N = W_norm.shape; m = mask.bool
+    K, N = W_norm.shape; m = mask.bool()
     if not (N > gsize and N % gsize == 0):
         return 0.0, 1.0
     ng = N // gsize; Wg = W_norm.view(K, ng, gsize); Mg = m.view(K, ng, gsize)
@@ -80,7 +80,7 @@ def hull_stats(W_norm, mask, gsize):
     fr = fr.clamp(min=1e-9)
     ratio = (sr / fr).clamp(0, 1)
     strict = (ratio < 0.999) & has
-    return float(strict.float.mean.item), float(ratio[has].mean.item)
+    return float(strict.float().mean().item()), float(ratio[has].mean().item())
 
 
 def run_model(MODEL, device="cuda"):
@@ -96,8 +96,8 @@ def run_model(MODEL, device="cuda"):
     except Exception as e:
         print(f"  [warn] ptb {repr(e)[:50]}", flush=True)
     for _l in ns.get_layers(model): _l.to("cpu")
-    torch.cuda.empty_cache
-    HK = list(A.keys)
+    torch.cuda.empty_cache()
+    HK = list(A.keys())
     lp = bs.get_layer_paths(model); layers = ns.get_layers(model); nl = len(layers)
     sample = sorted(set([1, nl // 2, nl - 2]))
     print(f"\n######## {MODEL} sample={sample} g={GROUP} H={HK} ########", flush=True)
@@ -119,18 +119,18 @@ def run_model(MODEL, device="cuda"):
             if not isinstance(lin, torch.nn.Linear): continue
             key = f'layer_{li}.{ap}'
             if A["fit"].get(key) is None: continue
-            W = lin.weight.data.clone.float.to(device); K, N = W.shape
+            W = lin.weight.data.clone().float().to(device); K, N = W.shape
             block = bs._largest_divisor_leq(N, GROUP)
             H = {}
             for hk in HK:
                 a = A[hk].get(key)
                 if a is None: H[hk] = None; continue
-                Xh = a.to(device).float
-                if Xh.dim == 3: Xh = Xh.reshape(-1, Xh.shape[-1])
+                Xh = a.to(device).float()
+                if Xh.dim() == 3: Xh = Xh.reshape(-1, Xh.shape[-1])
                 Xh = Xh[:min(Xh.shape[0], CAP)]
-                H[hk] = Xh.t @ Xh
-            Xf = A["fit"][key].to(device).float
-            if Xf.dim == 3: Xf = Xf.reshape(-1, Xf.shape[-1])
+                H[hk] = Xh.t() @ Xh
+            Xf = A["fit"][key].to(device).float()
+            if Xf.dim() == 3: Xf = Xf.reshape(-1, Xf.shape[-1])
             Xf = Xf[:min(Xf.shape[0], CAP)]
             colE = (Xf * Xf).sum(0).clamp(min=0)
             for mk in MK:
@@ -140,14 +140,14 @@ def run_model(MODEL, device="cuda"):
                     W_comp, mask = ns.wanda_mask_and_obs(W, A["fit"][key].to(device), SP, device, scope='per_row')
                 else:
                     W_comp, mask = magnitude_mask_and_obs(W, A["fit"][key].to(device), SP, device)
-                r, c = ns.compute_norm_scales(W_comp, mask, 'col', device); mkf = mask.float
+                r, c = ns.compute_norm_scales(W_comp, mask, 'col', device); mkf = mask.float()
                 rc = r.view(-1, 1) * c.view(1, -1)
                 W_norm = W_comp / rc
                 fe, rr = hull_stats(W_norm, mask, block)
                 hull[mk][0] += fe; hull[mk][1] += rr
                 # rtn (full-group scale, deployed)
                 q, s, z, _ = quantize_rtn(W_norm, mm, group_size=block)
-                s = (s * r.view(-1, 1, 1)) if s.dim == 3 else (s * r.view(-1, 1))
+                s = (s * r.view(-1, 1, 1)) if s.dim() == 3 else (s * r.view(-1, 1))
                 s = torch.nan_to_num(s, nan=1e-4, posinf=6e4, neginf=1e-4).clamp(min=1e-8, max=6e4)
                 D_rtn = eq.dequant_deployed(q, s, z, mkf, c) - W
                 # sscale
@@ -160,7 +160,7 @@ def run_model(MODEL, device="cuda"):
                     tot[mk]["sscale"][hk] += out_err(D_ss, H[hk])
                     tot[mk]["awclip"][hk] += out_err(D_aw, H[hk])
             nmat += 1
-        layers[li] = layer.to("cpu"); torch.cuda.empty_cache
+        layers[li] = layer.to("cpu"); torch.cuda.empty_cache()
     print(f"  pooled {nmat} matrices/mask. frac_ext=groups w/ pruned pos at hull; rr=surv/full range.", flush=True)
     print(f"  GAIN = 1 - e/e_rtn_full (deployed). sscale is calib-FREE (overfit-immune).", flush=True)
     for mk in MK:
@@ -173,11 +173,11 @@ def run_model(MODEL, device="cuda"):
         print(row, flush=True)
 
 
-def main:
-    P = argparse.ArgumentParser; P.add_argument("--models", default="gemma-2b,tinyllama,qwen-1.5b")
-    Aa = P.parse_args
-    for m in Aa.models.split(","): run_model(m.strip)
+def main():
+    P = argparse.ArgumentParser(); P.add_argument("--models", default="gemma-2b,tinyllama,qwen-1.5b")
+    Aa = P.parse_args()
+    for m in Aa.models.split(","): run_model(m.strip())
 
 
 if __name__ == "__main__":
-    main
+    main()

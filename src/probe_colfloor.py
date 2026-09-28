@@ -26,19 +26,19 @@ def col_stats(mask, sp):
     K, N = mask.shape
     cc = mask.sum(dim=0)                      # [N] survivors per column
     tgt = (1.0 - sp) * K
-    return dict(tgt=tgt, cmin=cc.min.item, cp1=torch.quantile(cc, 0.01).item,
-                cp5=torch.quantile(cc, 0.05).item, cmean=cc.mean.item,
-                frac_lt_half=(cc < 0.5 * tgt).float.mean.item,
-                frac_lt_qtr=(cc < 0.25 * tgt).float.mean.item,
-                frac_dead=(cc == 0).float.mean.item)
+    return dict(tgt=tgt, cmin=cc.min().item(), cp1=torch.quantile(cc, 0.01).item(),
+                cp5=torch.quantile(cc, 0.05).item(), cmean=cc.mean().item(),
+                frac_lt_half=(cc < 0.5 * tgt).float().mean().item(),
+                frac_lt_qtr=(cc < 0.25 * tgt).float().mean().item(),
+                frac_dead=(cc == 0).float().mean().item())
 
 
-def main:
-    ap = argparse.ArgumentParser
+def main():
+    ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True)
     ap.add_argument("--sparsities", default="0.6,0.7")
     ap.add_argument("--n-mats", type=int, default=8, help="sample this many Linear matrices")
-    args = ap.parse_args
+    args = ap.parse_args()
     name = bs.MODELS[args.model]
     tok = AutoTokenizer.from_pretrained(name)
     if tok.pad_token is None:
@@ -71,9 +71,9 @@ def main:
         agg = {k: [] for k in ["cmin", "cp1", "cp5", "frac_lt_half", "frac_lt_qtr", "frac_dead"]}
         aggw = {k: [] for k in agg}
         for (li, ap_, mod, X) in sample:
-            W = mod.weight.data.clone.float.to(DEV)
+            W = mod.weight.data.clone().float().to(DEV)
             Xd = X.to(DEV)
-            if Xd.dim == 3:
+            if Xd.dim() == 3:
                 Xd = Xd.reshape(-1, Xd.shape[-1])
             Xd = Xd[:min(Xd.shape[0], 256)]
             _, mb = ns.balanced_mask_and_obs(W, Xd, sp, DEV, col_exp=0.5, no_obs=True)
@@ -92,4 +92,4 @@ def main:
 
 
 if __name__ == "__main__":
-    main
+    main()

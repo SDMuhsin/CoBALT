@@ -37,10 +37,10 @@ from sinq.sparse_quant import quantize_rtn  # noqa: E402
 from transformers import AutoModelForCausalLM, AutoTokenizer  # noqa: E402
 
 import argparse as _ap
-_P = _ap.ArgumentParser
+_P = _ap.ArgumentParser()
 _P.add_argument("--model", default="gemma-2b")
 _P.add_argument("--alphas", default="1.1,1.05,1.0,0.95,0.9,0.85,0.8")
-_A, _ = _P.parse_known_args
+_A, _ = _P.parse_known_args()
 MODEL = _A.model
 NBITS = 3
 GROUP = 64
@@ -56,13 +56,13 @@ def group_affine(W_norm, mask, gsize):
     grouped = N > gsize and N % gsize == 0
     if grouped:
         Wg = W_norm.view(K, N // gsize, gsize)
-        Mg = mask.view(K, N // gsize, gsize).bool
+        Mg = mask.view(K, N // gsize, gsize).bool()
     else:
         Wg = W_norm.unsqueeze(1)
-        Mg = mask.unsqueeze(1).bool
+        Mg = mask.unsqueeze(1).bool()
     cnt = Mg.sum(-1, keepdim=True).clamp(min=1.0)
     mu = torch.where(Mg, Wg, torch.zeros_like(Wg)).sum(-1, keepdim=True) / cnt
-    A = torch.where(Mg, (Wg - mu).abs, torch.zeros_like(Wg)).amax(-1, keepdim=True).clamp(min=1e-8)
+    A = torch.where(Mg, (Wg - mu).abs(), torch.zeros_like(Wg)).amax(-1, keepdim=True).clamp(min=1e-8)
     empty = ~Mg.any(-1, keepdim=True)
     mu = torch.where(empty, torch.zeros_like(mu), mu)
     A = torch.where(empty, torch.ones_like(A), A)
@@ -78,7 +78,7 @@ def bincenter_quantize(W_norm, mask, nbits, gsize, alpha=1.0):
     law). Same 2 stored values/group as RTN, same dense format. Non-iterative, global
     rule. Returns W_hat_norm [K,N] (survivors coded; non-survivors decode via mask)."""
     K, N = W_norm.shape
-    m = mask.bool
+    m = mask.bool()
     L = 2 ** nbits
     grouped = N > gsize and N % gsize == 0
     if grouped:
@@ -107,16 +107,16 @@ def build_codebook(t_samples, weights, L, bins=4096, eps=1e-12):
     """Panter-Dite density^{1/3} compander codebook on weighted samples t in [-1,1].
     Non-iterative: one weighted histogram -> compander g -> invert to L levels."""
     device = t_samples.device
-    idx = (((t_samples + 1.0) * 0.5) * bins).clamp(0, bins - 1).long
+    idx = (((t_samples + 1.0) * 0.5) * bins).clamp(0, bins - 1).long()
     wh = torch.zeros(bins, device=device).scatter_add_(0, idx, weights.to(device))
-    f = wh / wh.sum.clamp(min=eps)
+    f = wh / wh.sum().clamp(min=eps)
     lam = f.clamp(min=0).pow(1.0 / 3.0)
-    lam = lam / lam.sum.clamp(min=eps)
+    lam = lam / lam.sum().clamp(min=eps)
     cdf = torch.cumsum(lam, 0)                      # compander g(t) in [0,1], length bins
     centers = torch.linspace(-1.0 + 1.0 / bins, 1.0 - 1.0 / bins, bins, device=device)
     targets = (torch.arange(L, device=device) + 0.5) / L
     # invert cdf (monotone nondecreasing) at targets via searchsorted
-    pos = torch.searchsorted(cdf.contiguous, targets.contiguous).clamp(0, bins - 1)
+    pos = torch.searchsorted(cdf.contiguous(), targets.contiguous()).clamp(0, bins - 1)
     codebook = centers[pos]
     codebook, _ = torch.sort(codebook)
     return codebook                                # [L]
@@ -124,14 +124,14 @@ def build_codebook(t_samples, weights, L, bins=4096, eps=1e-12):
 
 def apply_codebook(t, mu, A, Mg, grouped, codebook, K, N):
     """Nearest-codebook quantize t, decode to normalized-W space W_hat_norm [K,N]."""
-    d = (t.unsqueeze(-1) - codebook.view(1, 1, 1, -1)).abs  # [...,L]
+    d = (t.unsqueeze(-1) - codebook.view(1, 1, 1, -1)).abs()  # [...,L]
     q = d.argmin(-1)
     t_hat = codebook[q]
     W_hat = mu + A * t_hat
     return W_hat.reshape(K, N)
 
 
-def main:
+def main():
     device = "cuda"
     name = bs.MODELS[MODEL]
     tok = AutoTokenizer.from_pretrained(name)
@@ -146,7 +146,7 @@ def main:
     acts_all = bs.collect_activations(model, cal, device)
     for _l in ns.get_layers(model):
         _l.to("cpu")
-    torch.cuda.empty_cache
+    torch.cuda.empty_cache()
 
     layer_paths = bs.get_layer_paths(model)
     n_layers = len(ns.get_layers(model))
@@ -178,15 +178,15 @@ def main:
             acts = acts_all.get(key)
             if acts is None:
                 continue
-            W = lin.weight.data.clone
+            W = lin.weight.data.clone()
             W_comp, mask = ns.balanced_mask_and_obs(W, acts.to(device), SP, device, col_exp=BETA)
             r, c = ns.compute_norm_scales(W_comp, mask, 'col', device)
             W_norm = W_comp / (r.view(-1, 1) * c.view(1, -1))
-            Xa = acts.to(device).float
-            if Xa.dim == 3:
+            Xa = acts.to(device).float()
+            if Xa.dim() == 3:
                 Xa = Xa.reshape(-1, Xa.shape[-1])
             Xa = Xa[:min(Xa.shape[0], CAP256)]
-            H = Xa.t @ Xa
+            H = Xa.t() @ Xa
             colE = (Xa * Xa).sum(0).clamp(min=0)            # ||X_j||^2  [N]
             K, N = W_norm.shape
             t, mu, A, Mg, grouped = group_affine(W_norm, mask, GROUP)
@@ -198,32 +198,32 @@ def main:
             step = (A_full * c.view(1, -1))
             wgt = (step * step) * colE.view(1, -1)          # [K,N]
             tflat = t.reshape(K, N)
-            m = mask.bool
-            pooled_t.append(tflat[m].detach)
-            pooled_w.append(wgt[m].detach)
-            pooled_wuw.append(torch.ones_like(wgt[m]).detach)
+            m = mask.bool()
+            pooled_t.append(tflat[m].detach())
+            pooled_w.append(wgt[m].detach())
+            pooled_wuw.append(torch.ones_like(wgt[m]).detach())
             cache.append((key, W_comp, mask, c, W_norm, H, r))
         layers[li] = layer.to("cpu")
-        torch.cuda.empty_cache
+        torch.cuda.empty_cache()
 
     T = torch.cat(pooled_t)
     Wt = torch.cat(pooled_w)
     Wuw = torch.cat(pooled_wuw)
     # distribution shape diagnostics (is the survivor law non-uniform at all?)
     def kurt(x):
-        x = x.float; m = x.mean; s = x.std.clamp(min=1e-12)
-        return float(((x - m) / s).pow(4).mean)
-    Tabs = T.abs.float
-    sub = Tabs if Tabs.numel <= 8_000_000 else Tabs[torch.randperm(Tabs.numel, device=Tabs.device)[:8_000_000]]
-    print(f"[shape] pooled survivors n={T.numel} | t: std={T.std:.4f} "
+        x = x.float(); m = x.mean(); s = x.std().clamp(min=1e-12)
+        return float(((x - m) / s).pow(4).mean())
+    Tabs = T.abs().float()
+    sub = Tabs if Tabs.numel() <= 8_000_000 else Tabs[torch.randperm(Tabs.numel(), device=Tabs.device)[:8_000_000]]
+    print(f"[shape] pooled survivors n={T.numel()} | t: std={T.std():.4f} "
           f"kurtosis={kurt(T):.3f} (uniform=1.8, gaussian=3.0) "
-          f"p50|t|={sub.median:.4f} p99|t|={sub.quantile(0.99):.4f}", flush=True)
+          f"p50|t|={sub.median():.4f} p99|t|={sub.quantile(0.99):.4f}", flush=True)
 
     L = 2 ** NBITS
     cb_w = build_codebook(T, Wt, L)
     cb_uw = build_codebook(T, Wuw, L)
-    print(f"[codebook] weighted   = {[round(x,3) for x in cb_w.tolist]}", flush=True)
-    print(f"[codebook] unweighted = {[round(x,3) for x in cb_uw.tolist]}", flush=True)
+    print(f"[codebook] weighted   = {[round(x,3) for x in cb_w.tolist()]}", flush=True)
+    print(f"[codebook] unweighted = {[round(x,3) for x in cb_uw.tolist()]}", flush=True)
 
     # ---- PASS 2: evaluate output error per matrix for each scheme
     ALPHAS = [float(x) for x in _A.alphas.split(",")]     # bin-center range-scaling grid (global DOF)
@@ -235,10 +235,10 @@ def main:
     print(f"\n{'matrix':<34}{'e_rtn':>12}{'gden/rtn':>11}{'compand/rtn':>12}{'saff/rtn':>10}{'binc1.0/rtn':>12}", flush=True)
     for (key, W_comp, mask, c, W_norm, H, r) in cache:
         K, N = W_norm.shape
-        m = mask.float
+        m = mask.float()
         # deployed RTN
         q, scales, zeros, _ = quantize_rtn(W_norm, [0, 2 ** NBITS - 1], group_size=GROUP)
-        if scales.dim == 3:
+        if scales.dim() == 3:
             scales = scales * r.view(-1, 1, 1)
         else:
             scales = scales * r.view(-1, 1)
@@ -268,7 +268,7 @@ def main:
         # saff: survivor-only AFFINE min-max UNIFORM grid at width b (range lever only,
         # no companding, no repack widening). Isolates the pruned-zero range waste.
         q_s, s_s, z_s = eq.repack_quantize(W_norm, m, NBITS, GROUP)
-        if s_s.dim == 3:
+        if s_s.dim() == 3:
             s_s = s_s * r.view(-1, 1, 1)
         else:
             s_s = s_s * r.view(-1, 1)
@@ -309,4 +309,4 @@ def main:
 
 
 if __name__ == "__main__":
-    main
+    main()

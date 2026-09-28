@@ -25,21 +25,21 @@ def mean_abs_adjcorr(W_norm, mask, gsize):
     K, N = W_norm.shape
     if not (N > gsize and N % gsize == 0):
         return None
-    m = mask.bool
+    m = mask.bool()
     # standardize columns over survivors
-    cnt = m.float.sum(0).clamp(min=2.0)
+    cnt = m.float().sum(0).clamp(min=2.0)
     mu = torch.where(m, W_norm, torch.zeros_like(W_norm)).sum(0) / cnt
     Wc = torch.where(m, W_norm - mu.view(1, -1), torch.zeros_like(W_norm))
-    sd = (torch.where(m, Wc * Wc, torch.zeros_like(Wc)).sum(0) / cnt).sqrt.clamp(min=1e-8)
+    sd = (torch.where(m, Wc * Wc, torch.zeros_like(Wc)).sum(0) / cnt).sqrt().clamp(min=1e-8)
     Z = Wc / sd.view(1, -1)                       # [K,N] standardized, 0 at pruned
     # adjacent within-group pairs: j and j+1 not crossing a group boundary
     cols = torch.arange(N, device=W_norm.device)
     same_group = (cols[:-1] // gsize) == (cols[1:] // gsize)
-    a = Z[:, :-1]; b = Z[:, 1:]; both = (m[:, :-1] & m[:, 1:]).float
+    a = Z[:, :-1]; b = Z[:, 1:]; both = (m[:, :-1] & m[:, 1:]).float()
     n_both = both.sum(0).clamp(min=1.0)
     corr = (a * b * both).sum(0) / n_both          # E[za zb] over jointly-surviving rows ~ corr
     corr = corr[same_group]
-    return float(corr.abs.mean.item)
+    return float(corr.abs().mean().item())
 
 
 def run_model(MODEL, device="cuda"):
@@ -51,7 +51,7 @@ def run_model(MODEL, device="cuda"):
     bs.move_embed_to_device(model, device)
     A = collect(model, tok, device, "wikitext2", 16)
     for _l in ns.get_layers(model): _l.to("cpu")
-    torch.cuda.empty_cache
+    torch.cuda.empty_cache()
     lp = bs.get_layer_paths(model); layers = ns.get_layers(model); nl = len(layers)
     sample = sorted(set([1, nl // 2, nl - 2]))
     print(f"\n######## {MODEL} sample={sample} g={GROUP} ########", flush=True)
@@ -69,7 +69,7 @@ def run_model(MODEL, device="cuda"):
             if not isinstance(lin, torch.nn.Linear): continue
             key = f'layer_{li}.{ap}'
             if A.get(key) is None: continue
-            W = lin.weight.data.clone.float.to(device); K, N = W.shape
+            W = lin.weight.data.clone().float().to(device); K, N = W.shape
             block = bs._largest_divisor_leq(N, GROUP)
             for mk in MK:
                 if mk == "balanced":
@@ -83,17 +83,17 @@ def run_model(MODEL, device="cuda"):
                 v = mean_abs_adjcorr(W_norm, mask, block)
                 if v is not None:
                     acc[mk][0] += v; acc[mk][1] += 1
-        layers[li] = layer.to("cpu"); torch.cuda.empty_cache
+        layers[li] = layer.to("cpu"); torch.cuda.empty_cache()
     print(f"  mean |adjacent within-group survivor correlation| (0 => jointly independent => VQ dead):", flush=True)
     for mk in MK:
         print(f"    {mk:<10} mean|corr|={acc[mk][0]/max(1,acc[mk][1]):.4f}", flush=True)
 
 
-def main:
-    P = argparse.ArgumentParser; P.add_argument("--models", default="gemma-2b,tinyllama,qwen-1.5b")
-    Aa = P.parse_args
-    for m in Aa.models.split(","): run_model(m.strip)
+def main():
+    P = argparse.ArgumentParser(); P.add_argument("--models", default="gemma-2b,tinyllama,qwen-1.5b")
+    Aa = P.parse_args()
+    for m in Aa.models.split(","): run_model(m.strip())
 
 
 if __name__ == "__main__":
-    main
+    main()

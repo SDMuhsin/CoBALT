@@ -70,25 +70,25 @@ def _run_to_block(model, blocks, li, batches, device, capture_paths=None):
 
             def mk(ap_):
                 def pre(mod, inp):
-                    x = inp[0].detach
-                    xin.setdefault(ap_, []).append(x.reshape(-1, x.shape[-1]).float.cpu)
+                    x = inp[0].detach()
+                    xin.setdefault(ap_, []).append(x.reshape(-1, x.shape[-1]).float().cpu())
                 return pre
             hooks.append(lin.register_forward_pre_hook(mk(ap)))
 
     def out_hook(mod, inp, out):
-        outs.append(_block_out(out).detach.float.cpu)
-        raise _Stop
+        outs.append(_block_out(out).detach().float().cpu())
+        raise _Stop()
     hooks.append(blocks[li].register_forward_hook(out_hook))
-    model.eval
-    with torch.no_grad:
+    model.eval()
+    with torch.no_grad():
         for b in batches:
             try:
                 model(b.to(device))
             except _Stop:
                 pass
     for h in hooks:
-        h.remove
-    xin = {k: torch.cat(v, 0) for k, v in xin.items}
+        h.remove()
+    xin = {k: torch.cat(v, 0) for k, v in xin.items()}
     return outs, xin
 
 
@@ -101,19 +101,19 @@ def _compress_block(block, dense_block, paths, xin, sp, beta, nbits, gsize, norm
         X = xin.get(ap)
         if X is None:
             continue
-        W = lin_d.weight.data.clone.float.to(device)
-        bias = lin_d.bias.data.clone if lin_d.bias is not None else None
+        W = lin_d.weight.data.clone().float().to(device)
+        bias = lin_d.bias.data.clone() if lin_d.bias is not None else None
         Xd = X.to(device)
         if sp > 0.0:
             W_comp, mask = ns.balanced_mask_and_obs(W, Xd, sp, device, col_exp=beta)
         else:
             W_comp, mask = W, torch.ones_like(W)
-        act_abs = Xd[:min(Xd.shape[0], 256)].abs.mean(0)
+        act_abs = Xd[:min(Xd.shape[0], 256)].abs().mean(0)
         K, N = W_comp.shape
         r, c = ns.compute_norm_scales(W_comp, mask, norm, device, act_abs=act_abs)
         W_norm = W_comp / (r.view(-1, 1) * c.view(1, -1))
         q, scales, zeros, _ = quantize_rtn(W_norm, [0, 2 ** nbits - 1], group_size=gsize)
-        scales = scales * (r.view(-1, 1, 1) if scales.dim == 3 else r.view(-1, 1))
+        scales = scales * (r.view(-1, 1, 1) if scales.dim() == 3 else r.view(-1, 1))
         scales = torch.nan_to_num(scales, nan=1e-4, posinf=6e4, neginf=1e-4).clamp(min=1e-8, max=6e4)
         q = q * mask.to(q.dtype)
         if quantizer != 'rtn' and sp > 0.0:
@@ -121,12 +121,12 @@ def _compress_block(block, dense_block, paths, xin, sp, beta, nbits, gsize, norm
             # changes (awclip). bpw-identical. Mirrors nosink.apply_wanda_obs_rtn's quantizer branch
             # so the sequential arm gets exactly the lever the non-sequential awclip arm gets.
             import eout_quant as eq
-            W_best, _info = eq.eout_requantize(W_comp.float, mask, Xd.float, nbits, gsize,
-                                               r, c, q, scales.float, zeros.float, arm=quantizer)
+            W_best, _info = eq.eout_requantize(W_comp.float(), mask, Xd.float(), nbits, gsize,
+                                               r, c, q, scales.float(), zeros.float(), arm=quantizer)
             lin_new = nn.Linear(N, K, bias=bias is not None)
-            lin_new.weight.data = W_best.half
+            lin_new.weight.data = W_best.half()
             if bias is not None:
-                lin_new.bias.data = bias.half
+                lin_new.bias.data = bias.half()
             lin_new = lin_new.to(device)
             tparent, tname, _ = _get_linear(block, ap)
             setattr(tparent, tname, lin_new)
@@ -134,12 +134,12 @@ def _compress_block(block, dense_block, paths, xin, sp, beta, nbits, gsize, norm
             continue
         meta = {'sparsity': sp, 'nbits': nbits, 'requested_nbits': nbits, 'group_size': gsize,
                 'shape': (K, N), 'method': f'cobalt_seq_{norm}', 'beta': beta}
-        new = bs.SparseQuantLinear(q.half, scales.half, zeros.half, mask.half, c.half,
+        new = bs.SparseQuantLinear(q.half(), scales.half(), zeros.half(), mask.half(), c.half(),
                                    bias.to(device) if bias is not None else None, meta).to(device)
         tparent, tname, _ = _get_linear(block, ap)
         setattr(tparent, tname, new)
         del W, W_comp, mask, q, scales, zeros, Xd
-    torch.cuda.empty_cache
+    torch.cuda.empty_cache()
 
 
 def apply_cobalt_seq(model, calibration_data, nbits, sparsity, device='cuda', betas=(0.0, 0.3, 0.5, 0.7, 1.0),
@@ -161,24 +161,24 @@ def apply_cobalt_seq(model, calibration_data, nbits, sparsity, device='cuda', be
     for i, blk in enumerate(blocks):
         def mk(i_):
             def h(mod, inp, out):
-                caps.setdefault(i_, []).append(_block_out(out).detach.float.cpu)
+                caps.setdefault(i_, []).append(_block_out(out).detach().float().cpu())
                 if i_ == L - 1:
-                    raise _Stop
+                    raise _Stop()
             return h
         hooks.append(blk.register_forward_hook(mk(i)))
-    model.eval
-    with torch.no_grad:
+    model.eval()
+    with torch.no_grad():
         for b in batches:
             try:
                 model(b.to(device))
             except _Stop:
                 pass
     for h in hooks:
-        h.remove
+        h.remove()
     h_dense = {i: caps[i] for i in range(L)}
     for blk in blocks:
         blk.to('cpu')
-    torch.cuda.empty_cache
+    torch.cuda.empty_cache()
 
     chosen, rel = [], []
     for li in range(L):
@@ -187,14 +187,14 @@ def apply_cobalt_seq(model, calibration_data, nbits, sparsity, device='cuda', be
         # 1. inputs of every linear of block li from the COMPRESSED prefix
         _, xin = _run_to_block(model, blocks, li, batches, device, capture_paths=paths)
         hd = h_dense[li]
-        den = sum(float(h.pow(2).sum) for h in hd)
+        den = sum(float(h.pow(2).sum()) for h in hd)
         best = (None, float('inf')); cand = {}
         for beta in betas:
             _compress_block(blk, dense_copy, paths, xin, sparsity, beta, nbits, group_size, norm, device, quantizer=quantizer)
             if len(betas) == 1:
                 best = (beta, float('nan')); break
             outs, _ = _run_to_block(model, blocks, li, batches, device)
-            num = sum(float((o - h).pow(2).sum) for o, h in zip(outs, hd))
+            num = sum(float((o - h).pow(2).sum()) for o, h in zip(outs, hd))
             r = (num / max(den, 1e-30)) ** 0.5
             cand[beta] = r
             if r < best[1]:
@@ -209,7 +209,7 @@ def apply_cobalt_seq(model, calibration_data, nbits, sparsity, device='cuda', be
         chosen.append(best[0]); rel.append(best[1])
         print(f"[cobalt-seq] block {li:02d}: beta*={best[0]:g} relerr={best[1]:.4f}", flush=True)
         del dense_copy, xin
-        gc.collect; torch.cuda.empty_cache
+        gc.collect(); torch.cuda.empty_cache()
     if log_path:
         os.makedirs(os.path.dirname(log_path), exist_ok=True)
         with open(log_path, 'a') as f:
@@ -234,18 +234,18 @@ def _capture_block_inputs(model, blocks, li, batches, device):
     caught = []
 
     def pre(mod, args, kwargs):
-        caught.append((tuple(a.detach if torch.is_tensor(a) else a for a in args),
-                       {k: (v.detach if torch.is_tensor(v) else v) for k, v in kwargs.items}))
-        raise _Stop
+        caught.append((tuple(a.detach() if torch.is_tensor(a) else a for a in args),
+                       {k: (v.detach() if torch.is_tensor(v) else v) for k, v in kwargs.items()}))
+        raise _Stop()
     h = blocks[li].register_forward_pre_hook(pre, with_kwargs=True)
-    model.eval
-    with torch.no_grad:
+    model.eval()
+    with torch.no_grad():
         for b in batches:
             try:
                 model(b.to(device))
             except _Stop:
                 pass
-    h.remove
+    h.remove()
     return caught
 
 
@@ -260,17 +260,17 @@ def _block_forward(block, inputs, capture_paths=None):
 
             def mk(ap_):
                 def pre(mod, inp):
-                    x = inp[0].detach
-                    xin.setdefault(ap_, []).append(x.reshape(-1, x.shape[-1]).float)
+                    x = inp[0].detach()
+                    xin.setdefault(ap_, []).append(x.reshape(-1, x.shape[-1]).float())
                 return pre
             hooks.append(lin.register_forward_pre_hook(mk(ap)))
     outs = []
-    with torch.no_grad:
+    with torch.no_grad():
         for args, kwargs in inputs:
-            outs.append(_block_out(block(*args, **kwargs)).detach.float)
+            outs.append(_block_out(block(*args, **kwargs)).detach().float())
     for h in hooks:
-        h.remove
-    return outs, {k: torch.cat(v, 0) for k, v in xin.items}
+        h.remove()
+    return outs, {k: torch.cat(v, 0) for k, v in xin.items()}
 
 
 def _with_hidden(inputs, hiddens):
@@ -292,12 +292,12 @@ def _corrected_weight(W, X, Xh, alpha, lam_frac):
     #   => W' = W (X^T X^ + lam I)(X^T X^ + lam I)^-1, which is exactly W when X^ = X (block 0) and tends
     # to the plain least-squares fit as lam -> 0. (First version omitted the lam I in the numerator and
     # shrank W in low-variance directions even with no incoming error -- monotone damage from block 0.)
-    G = Xh.t @ Xh
-    lam = lam_frac * G.diagonal.mean.clamp(min=1e-8)
-    G.diagonal.add_(lam)
-    C = X.t @ Xh                                   # [N,N]: X^T X^
-    C.diagonal.add_(lam)
-    M = torch.linalg.solve(G, C.t).t             # (C + lam I) (G + lam I)^-1
+    G = Xh.t() @ Xh
+    lam = lam_frac * G.diagonal().mean().clamp(min=1e-8)
+    G.diagonal().add_(lam)
+    C = X.t() @ Xh                                   # [N,N]: X^T X^
+    C.diagonal().add_(lam)
+    M = torch.linalg.solve(G, C.t()).t()             # (C + lam I) (G + lam I)^-1
     W_ls = W @ M
     del G, C, M
     return W + alpha * (W_ls - W)
@@ -308,30 +308,30 @@ def _compress_block_ec(block, dense_block, paths, X_d, X_h, sp, beta, alpha, nbi
         _, _, lin_d = _get_linear(dense_block, ap)
         if lin_d is None or not isinstance(lin_d, nn.Linear) or ap not in X_h:
             continue
-        W = lin_d.weight.data.clone.float.to(device)
-        bias = lin_d.bias.data.clone if lin_d.bias is not None else None
+        W = lin_d.weight.data.clone().float().to(device)
+        bias = lin_d.bias.data.clone() if lin_d.bias is not None else None
         Xh = X_h[ap]; Xd = X_d[ap]
         Wc = _corrected_weight(W, Xd, Xh, alpha, lam_frac)
         if sp > 0.0:
             W_comp, mask = ns.balanced_mask_and_obs(Wc, Xh, sp, device, col_exp=beta)
         else:
             W_comp, mask = Wc, torch.ones_like(Wc)
-        act_abs = Xh[:min(Xh.shape[0], 256)].abs.mean(0)
+        act_abs = Xh[:min(Xh.shape[0], 256)].abs().mean(0)
         K, N = W_comp.shape
         r, c = ns.compute_norm_scales(W_comp, mask, norm, device, act_abs=act_abs)
         W_norm = W_comp / (r.view(-1, 1) * c.view(1, -1))
         q, scales, zeros, _ = quantize_rtn(W_norm, [0, 2 ** nbits - 1], group_size=gsize)
-        scales = scales * (r.view(-1, 1, 1) if scales.dim == 3 else r.view(-1, 1))
+        scales = scales * (r.view(-1, 1, 1) if scales.dim() == 3 else r.view(-1, 1))
         scales = torch.nan_to_num(scales, nan=1e-4, posinf=6e4, neginf=1e-4).clamp(min=1e-8, max=6e4)
         q = q * mask.to(q.dtype)
         meta = {'sparsity': sp, 'nbits': nbits, 'requested_nbits': nbits, 'group_size': gsize,
                 'shape': (K, N), 'method': f'cobalt_ec_{norm}', 'beta': beta, 'alpha': alpha}
-        new = bs.SparseQuantLinear(q.half, scales.half, zeros.half, mask.half, c.half,
+        new = bs.SparseQuantLinear(q.half(), scales.half(), zeros.half(), mask.half(), c.half(),
                                    bias.to(device) if bias is not None else None, meta).to(device)
         tparent, tname, _ = _get_linear(block, ap)
         setattr(tparent, tname, new)
         del W, Wc, W_comp, mask, q, scales, zeros
-    torch.cuda.empty_cache
+    torch.cuda.empty_cache()
 
 
 def apply_cobalt_ec(model, calibration_data, nbits, sparsity, device='cuda', alphas=(0.0, 0.5, 1.0),
@@ -362,35 +362,35 @@ def apply_cobalt_ec(model, calibration_data, nbits, sparsity, device='cuda', alp
         for i, blk in enumerate(blocks):
             def mkp(i_):
                 def pre(mod, args, kwargs):
-                    ins.setdefault(i_, []).append((tuple(a.detach.cpu if torch.is_tensor(a) else a for a in args),
-                                                   {k: (v.detach.cpu if torch.is_tensor(v) else v) for k, v in kwargs.items}))
+                    ins.setdefault(i_, []).append((tuple(a.detach().cpu() if torch.is_tensor(a) else a for a in args),
+                                                   {k: (v.detach().cpu() if torch.is_tensor(v) else v) for k, v in kwargs.items()}))
                 return pre
 
             def mko(i_):
                 def h(mod, inp, out):
-                    outs.setdefault(i_, []).append(_block_out(out).detach.float.cpu)
+                    outs.setdefault(i_, []).append(_block_out(out).detach().float().cpu())
                     if i_ == L - 1:
-                        raise _Stop
+                        raise _Stop()
                 return h
             hooks.append(blk.register_forward_pre_hook(mkp(i), with_kwargs=True))
             hooks.append(blk.register_forward_hook(mko(i)))
-        model.eval
-        with torch.no_grad:
+        model.eval()
+        with torch.no_grad():
             for b in batches:
                 try:
                     model(b.to(device))
                 except _Stop:
                     pass
         for h in hooks:
-            h.remove
+            h.remove()
         d_in[name], d_out[name] = ins, outs
     for blk in blocks:
         blk.to('cpu')
-    torch.cuda.empty_cache
+    torch.cuda.empty_cache()
 
     def to_dev(inputs):
         return [(tuple(a.to(device) if torch.is_tensor(a) else a for a in args),
-                 {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in kwargs.items}) for args, kwargs in inputs]
+                 {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in kwargs.items()}) for args, kwargs in inputs]
 
     chosen, rel = [], []
     for li in range(L):
@@ -403,12 +403,12 @@ def apply_cobalt_ec(model, calibration_data, nbits, sparsity, device='cuda', alp
         _, X_d = _block_forward(dense_copy, to_dev(d_in["cal"][li]), capture_paths=paths)
         _, X_h = _block_forward(dense_copy, c_in, capture_paths=paths)
         h_ref = [h.to(device) for h in d_out["sel" if heldout_data is not None else "cal"][li]]
-        den = sum(float(h.pow(2).sum) for h in h_ref)
+        den = sum(float(h.pow(2).sum()) for h in h_ref)
         best, scores = (None, float('inf')), {}
         for (a, b, lm) in cands:
             _compress_block_ec(blk, dense_copy, paths, X_d, X_h, sparsity, b, a, nbits, group_size, norm, device, lm)
             outs, _ = _block_forward(blk, s_in)      # scored even for a single candidate (diagnostic trace)
-            num = sum(float((o - h).pow(2).sum) for o, h in zip(outs, h_ref))
+            num = sum(float((o - h).pow(2).sum()) for o, h in zip(outs, h_ref))
             r = (num / max(den, 1e-30)) ** 0.5
             scores[(a, b, lm)] = r
             if r < best[1]:
@@ -419,12 +419,12 @@ def apply_cobalt_ec(model, calibration_data, nbits, sparsity, device='cuda', alp
         chosen.append(best[0]); rel.append(best[1])
         _lab = lambda c: f"a{c[0]:g}b{c[1]:g}l{c[2]:g}"
         print(f"[cobalt-ec] block {li:02d}: best={_lab(best[0])} relerr={best[1]:.4f} | "
-              + " ".join(f"{_lab(c)}={s:.4f}" for c, s in scores.items), flush=True)
+              + " ".join(f"{_lab(c)}={s:.4f}" for c, s in scores.items()), flush=True)
         if log_path:
             os.makedirs(os.path.dirname(log_path), exist_ok=True)
             with open(log_path, 'a') as f:
                 f.write(f"{tag}\tbits={nbits}\tsp={sparsity}\tblock={li}\tbest={_lab(best[0])}\t"
-                        + "\t".join(f"{_lab(c)}={s:.5f}" for c, s in scores.items) + "\n")
+                        + "\t".join(f"{_lab(c)}={s:.5f}" for c, s in scores.items()) + "\n")
         del dense_copy, X_d, X_h, c_in, s_in, h_ref
-        gc.collect; torch.cuda.empty_cache
+        gc.collect(); torch.cuda.empty_cache()
     return model, chosen, rel

@@ -19,21 +19,21 @@ DEV = "cuda"
 
 
 def _jacc(a, b):
-    a = a.bool; b = b.bool
-    return ((a & b).sum / (a | b).sum.clamp(min=1)).item
+    a = a.bool(); b = b.bool()
+    return ((a & b).sum() / (a | b).sum().clamp(min=1)).item()
 
 
 def _colstats(m):
     c = m.sum(0)
-    return (c.std / (c.mean + 1e-9)).item, (c == 0).float.mean.item
+    return (c.std() / (c.mean() + 1e-9)).item(), (c == 0).float().mean().item()
 
 
-def main:
-    ap = argparse.ArgumentParser
+def main():
+    ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True)
     ap.add_argument("--beta", type=float, default=0.5)
     ap.add_argument("--n-mats", type=int, default=12)
-    args = ap.parse_args
+    args = ap.parse_args()
     name = bs.MODELS[args.model]
     tok = AutoTokenizer.from_pretrained(name)
     if tok.pad_token is None:
@@ -60,9 +60,9 @@ def main:
     sample = items[::step][:args.n_mats]
     rows = []
     for (li, ap_, mod, X) in sample:
-        W = mod.weight.data.clone.float.to(DEV)
+        W = mod.weight.data.clone().float().to(DEV)
         Xd = X.to(DEV)
-        if Xd.dim == 3:
+        if Xd.dim() == 3:
             Xd = Xd.reshape(-1, Xd.shape[-1])
         Xd = Xd[:min(Xd.shape[0], 256)]
         ns.NM_PATTERN = None
@@ -85,4 +85,4 @@ def main:
 
 
 if __name__ == "__main__":
-    main
+    main()

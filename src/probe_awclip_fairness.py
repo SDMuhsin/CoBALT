@@ -43,8 +43,8 @@ CAP256 = 256
 
 
 def out_err(W_hat, W_dense, H):
-    D = (W_hat - W_dense).double
-    return float((D @ H.double * D).sum.item)
+    D = (W_hat - W_dense).double()
+    return float((D @ H.double() * D).sum().item())
 
 
 def run_model(MODEL, device="cuda"):
@@ -61,7 +61,7 @@ def run_model(MODEL, device="cuda"):
     acts_all = bs.collect_activations(model, cal, device)
     for _l in ns.get_layers(model):
         _l.to("cpu")
-    torch.cuda.empty_cache
+    torch.cuda.empty_cache()
     layer_paths = bs.get_layer_paths(model)
     layers = ns.get_layers(model)
     n_layers = len(layers)
@@ -87,14 +87,14 @@ def run_model(MODEL, device="cuda"):
             acts = acts_all.get(f'layer_{li}.{ap}')
             if acts is None:
                 continue
-            W = lin.weight.data.clone.float.to(device)
+            W = lin.weight.data.clone().float().to(device)
             K, N = W.shape
             block = bs._largest_divisor_leq(N, GROUP)
-            Xa = acts.to(device).float
-            if Xa.dim == 3:
+            Xa = acts.to(device).float()
+            if Xa.dim() == 3:
                 Xa = Xa.reshape(-1, Xa.shape[-1])
             Xa = Xa[:min(Xa.shape[0], CAP256)]
-            H = Xa.t @ Xa
+            H = Xa.t() @ Xa
             colE = (Xa * Xa).sum(0).clamp(min=0)                # [N] ||X_j||^2
 
             # ---- COBALT arm (balanced mask + OBS + col-norm) ----
@@ -102,12 +102,12 @@ def run_model(MODEL, device="cuda"):
             r_c, c_c = ns.compute_norm_scales(W_comp, mask_c, 'col', device)
             W_norm_c = W_comp / (r_c.view(-1, 1) * c_c.view(1, -1))
             q, s, z, _ = quantize_rtn(W_norm_c, min_max, group_size=block)
-            if s.dim == 3:
+            if s.dim() == 3:
                 s = s * r_c.view(-1, 1, 1)
             else:
                 s = s * r_c.view(-1, 1)
             s = torch.nan_to_num(s, nan=1e-4, posinf=6e4, neginf=1e-4).clamp(min=1e-8, max=6e4)
-            W_cob_rtn = eq.dequant_deployed(q, s, z, mask_c.float, c_c)
+            W_cob_rtn = eq.dequant_deployed(q, s, z, mask_c.float(), c_c)
             W_cob_awc = eq.awclip_only(W_comp, mask_c, NBITS, block, r_c, c_c, colE)
 
             # ---- WANDA-AWQ arm (per-row Wanda mask + AWQ scale) ----
@@ -119,7 +119,7 @@ def run_model(MODEL, device="cuda"):
                                                    min_max=min_max, block=block,
                                                    scales=awq_scales) * mask_a
             r_a = torch.ones(K, device=device)
-            c_a = (1.0 / awq_scales.to(device).float.clamp(min=1e-8)).view(-1)
+            c_a = (1.0 / awq_scales.to(device).float().clamp(min=1e-8)).view(-1)
             W_awq_awc = eq.awclip_only(W_pruned, mask_a, NBITS, block, r_a, c_a, colE)
 
             e = {"cob_rtn": out_err(W_cob_rtn, W, H), "cob_awc": out_err(W_cob_awc, W, H),
@@ -130,7 +130,7 @@ def run_model(MODEL, device="cuda"):
                 win_cob_vs_awqawc += 1
             nmat += 1
         layers[li] = layer.to("cpu")
-        torch.cuda.empty_cache
+        torch.cuda.empty_cache()
 
     g_cob = 1 - tot["cob_awc"] / tot["cob_rtn"]
     g_awq = 1 - tot["awq_awc"] / tot["awq_rtn"]
@@ -144,13 +144,13 @@ def run_model(MODEL, device="cuda"):
           f"(mask/OBS effect BEFORE any clip lever)", flush=True)
 
 
-def main:
-    P = argparse.ArgumentParser
+def main():
+    P = argparse.ArgumentParser()
     P.add_argument("--models", default="gemma-2b,tinyllama,qwen-1.5b")
-    A = P.parse_args
+    A = P.parse_args()
     for m in A.models.split(","):
-        run_model(m.strip)
+        run_model(m.strip())
 
 
 if __name__ == "__main__":
-    main
+    main()

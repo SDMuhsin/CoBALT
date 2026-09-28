@@ -24,7 +24,7 @@ def compute(MODEL, n_samples, seq_len, tok_cap):
     torch.manual_seed(0)
     model = AutoModelForCausalLM.from_pretrained(name, torch_dtype=torch.bfloat16,
                                                  device_map=DEV, low_cpu_mem_usage=True)
-    model.eval
+    model.eval()
     layers = bs.get_transformer_layers(model)
     paths = bs.get_layer_paths(model)
     targets = {}
@@ -41,50 +41,50 @@ def compute(MODEL, n_samples, seq_len, tok_cap):
     def mk(k):
         def h(mod, inp, out):
             o = out[0] if isinstance(out, tuple) else out
-            o.retain_grad; caps[k] = o
-            cap_in[k] = (inp[0] if isinstance(inp, tuple) else inp).detach
+            o.retain_grad(); caps[k] = o
+            cap_in[k] = (inp[0] if isinstance(inp, tuple) else inp).detach()
         return h
-    for k, mod in targets.items:
+    for k, mod in targets.items():
         hooks.append(mod.register_forward_hook(mk(k)))
     fint = {k: None for k in targets}
     cnt = 0
     torch.manual_seed(0)
     data = bs.get_calibration_data(tok, n_samples=n_samples, seq_len=seq_len, dataset_key="wikitext2")
     for i in range(data.shape[0]):
-        model.zero_grad(set_to_none=True); caps.clear; cap_in.clear
-        out = model(data[i:i+1].to(DEV), labels=data[i:i+1].to(DEV)); out.loss.backward
-        for k, o in caps.items:
+        model.zero_grad(set_to_none=True); caps.clear(); cap_in.clear()
+        out = model(data[i:i+1].to(DEV), labels=data[i:i+1].to(DEV)); out.loss.backward()
+        for k, o in caps.items():
             if o.grad is None:
                 continue
-            g = o.grad.reshape(-1, o.grad.shape[-1]).float
-            x = cap_in[k].reshape(-1, cap_in[k].shape[-1]).float
+            g = o.grad.reshape(-1, o.grad.shape[-1]).float()
+            x = cap_in[k].reshape(-1, cap_in[k].shape[-1]).float()
             m = min(g.shape[0], tok_cap)
-            fi = (g[:m] ** 2).t @ (x[:m] ** 2) / m
-            fint[k] = fi.cpu if fint[k] is None else fint[k] + fi.cpu
+            fi = (g[:m] ** 2).t() @ (x[:m] ** 2) / m
+            fint[k] = fi.cpu() if fint[k] is None else fint[k] + fi.cpu()
         cnt += 1
     for hk in hooks:
-        hk.remove
+        hk.remove()
     out_dir = os.path.join(_ROOT, "results", "fisher_int", MODEL)
     os.makedirs(out_dir, exist_ok=True)
     n = 0
-    for k, v in fint.items:
+    for k, v in fint.items():
         if v is None:
             continue
-        torch.save((v / cnt).half, os.path.join(out_dir, k + ".pt"))
+        torch.save((v / cnt).half(), os.path.join(out_dir, k + ".pt"))
         n += 1
     print(f"[{MODEL}] saved {n} interaction matrices -> {out_dir}")
 
 
-def main:
-    ap = argparse.ArgumentParser
+def main():
+    ap = argparse.ArgumentParser()
     ap.add_argument("--models", default="tinyllama,qwen-1.5b,gemma-2b")
     ap.add_argument("--n-samples", type=int, default=4)
     ap.add_argument("--seq-len", type=int, default=256)
     ap.add_argument("--tok-cap", type=int, default=512)
-    args = ap.parse_args
+    args = ap.parse_args()
     for m in args.models.split(","):
-        compute(m.strip, args.n_samples, args.seq_len, args.tok_cap)
+        compute(m.strip(), args.n_samples, args.seq_len, args.tok_cap)
 
 
 if __name__ == "__main__":
-    main
+    main()

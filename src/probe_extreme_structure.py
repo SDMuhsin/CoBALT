@@ -34,9 +34,9 @@ def analyze(W_norm, mask, colnorm, gsize):
     if not (N > gsize and N % gsize == 0):
         return None
     ng = N // gsize
-    Wg = W_norm.view(K, ng, gsize); Mg = mask.view(K, ng, gsize).bool
+    Wg = W_norm.view(K, ng, gsize); Mg = mask.view(K, ng, gsize).bool()
     cn = colnorm.view(1, ng, gsize)                             # per-column ||X|| broadcast
-    absW = torch.where(Mg, Wg.abs, torch.full_like(Wg, -1.0))
+    absW = torch.where(Mg, Wg.abs(), torch.full_like(Wg, -1.0))
     amax_idx = absW.argmax(-1, keepdim=True)                    # [K,ng,1] extreme position per (row,grp)
     # group median ||X|| over SURVIVOR columns (approx via masked median -> use masked mean as robust proxy)
     cnt = Mg.sum(-1, keepdim=True).clamp(min=1.0)
@@ -45,11 +45,11 @@ def analyze(W_norm, mask, colnorm, gsize):
     ext_colnorm = torch.gather(cn.expand_as(Wg), -1, amax_idx)  # ||X|| of the extreme's column
     ext_low = (ext_colnorm < med)                              # [K,ng,1] bool: extreme in low-||X|| col
     valid = Mg.any(-1, keepdim=True)
-    p_low = float((ext_low & valid).float.sum / valid.float.sum.clamp(min=1))
+    p_low = float((ext_low & valid).float().sum() / valid.float().sum().clamp(min=1))
     # RTN recon (survivor min/max)
     def recon(exclude_extreme):
         big = torch.finfo(torch.float32).max
-        m = Mg.clone
+        m = Mg.clone()
         if exclude_extreme is not None:
             drop = exclude_extreme & Mg.any(-1, keepdim=True)
             # remove the extreme position from the scale set where drop
@@ -81,7 +81,7 @@ def run_model(MODEL, device="cuda"):
     except Exception as e:
         print(f"  [warn] ptb {repr(e)[:40]}", flush=True)
     for _l in ns.get_layers(model): _l.to("cpu")
-    torch.cuda.empty_cache
+    torch.cuda.empty_cache()
     HKEY = "ptb" if "ptb" in A else "fit"
     lp = bs.get_layer_paths(model); layers = ns.get_layers(model); nl = len(layers)
     sample = sorted(set([1, nl // 2, nl - 2]))
@@ -100,14 +100,14 @@ def run_model(MODEL, device="cuda"):
             if not isinstance(lin, torch.nn.Linear): continue
             key = f'layer_{li}.{ap}'
             if A["fit"].get(key) is None: continue
-            W = lin.weight.data.clone.float.to(device); K, N = W.shape
+            W = lin.weight.data.clone().float().to(device); K, N = W.shape
             block = bs._largest_divisor_leq(N, GROUP)
-            Xh = A[HKEY][key].to(device).float
-            if Xh.dim == 3: Xh = Xh.reshape(-1, Xh.shape[-1])
+            Xh = A[HKEY][key].to(device).float()
+            if Xh.dim() == 3: Xh = Xh.reshape(-1, Xh.shape[-1])
             Xh = Xh[:min(Xh.shape[0], CAP)]
-            H = Xh.t @ Xh
+            H = Xh.t() @ Xh
             Xf = A["fit"][key].to(device)
-            colnorm = torch.norm(Xf.float.reshape(-1, N), dim=0)   # ||X|| per input col (fit)
+            colnorm = torch.norm(Xf.float().reshape(-1, N), dim=0)   # ||X|| per input col (fit)
             for mk in MK:
                 if mk == "balanced":
                     W_comp, mask = ns.balanced_mask_and_obs(W, Xf, SP, device, col_exp=BETA)
@@ -115,7 +115,7 @@ def run_model(MODEL, device="cuda"):
                     W_comp, mask = ns.wanda_mask_and_obs(W, Xf, SP, device, scope='per_row')
                 else:
                     W_comp, mask = magnitude_mask_and_obs(W, Xf, SP, device)
-                r, c = ns.compute_norm_scales(W_comp, mask, 'col', device); mkf = mask.float
+                r, c = ns.compute_norm_scales(W_comp, mask, 'col', device); mkf = mask.float()
                 rc = r.view(-1, 1) * c.view(1, -1)
                 W_norm = W_comp / rc
                 res = analyze(W_norm, mkf, colnorm, block)
@@ -124,7 +124,7 @@ def run_model(MODEL, device="cuda"):
                 acc[mk]["p"] += p_low; acc[mk]["np"] += 1
                 acc[mk]["rtn"] += out_err(W_rtn * rc * mkf - W, H)
                 acc[mk]["sclip"] += out_err(W_sclip * rc * mkf - W, H)
-        layers[li] = layer.to("cpu"); torch.cuda.empty_cache
+        layers[li] = layer.to("cpu"); torch.cuda.empty_cache()
     print(f"  P(extreme in low-||X|| col) and sclip held-out({HKEY}) GAIN vs RTN:", flush=True)
     for mk in MK:
         a = acc[mk]; n = max(1, a["np"])
@@ -134,11 +134,11 @@ def run_model(MODEL, device="cuda"):
     print(f"    Δ(bal-wan) sclip = {(gb-gw)*100:+.2f}pt  {'<== balance-SPECIFIC' if gb>gw+0.02 else '(balance-agnostic)'}", flush=True)
 
 
-def main:
-    P = argparse.ArgumentParser; P.add_argument("--models", default="gemma-2b,tinyllama,qwen-1.5b")
-    Aa = P.parse_args
-    for m in Aa.models.split(","): run_model(m.strip)
+def main():
+    P = argparse.ArgumentParser(); P.add_argument("--models", default="gemma-2b,tinyllama,qwen-1.5b")
+    Aa = P.parse_args()
+    for m in Aa.models.split(","): run_model(m.strip())
 
 
 if __name__ == "__main__":
-    main
+    main()

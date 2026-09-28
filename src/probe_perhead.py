@@ -17,11 +17,11 @@ from transformers import AutoModelForCausalLM, AutoTokenizer  # noqa
 DEV = "cuda"
 
 
-def main:
-    ap = argparse.ArgumentParser
+def main():
+    ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True)
     ap.add_argument("--sparsity", type=float, default=0.6)
-    args = ap.parse_args
+    args = ap.parse_args()
     name = bs.MODELS[args.model]
     tok = AutoTokenizer.from_pretrained(name)
     if tok.pad_token is None:
@@ -51,9 +51,9 @@ def main:
             if not (ok and isinstance(mod, nn.Linear)):
                 continue
             is_o = ap_.endswith('o_proj') or ap_.endswith('out_proj') or ap_.endswith('.o')
-            W = mod.weight.data.clone.float.to(DEV)
+            W = mod.weight.data.clone().float().to(DEV)
             Xd = X.to(DEV)
-            if Xd.dim == 3:
+            if Xd.dim() == 3:
                 Xd = Xd.reshape(-1, Xd.shape[-1])
             Xd = Xd[:min(Xd.shape[0], 256)]
             _, mask = ns.balanced_mask_and_obs(W, Xd, sp, DEV, col_exp=0.5, no_obs=True)
@@ -61,12 +61,12 @@ def main:
             if is_o and hd and N % hd == 0 and N // hd == nheads:
                 # INPUT channels head-partitioned: per-head keep-rate = mean over that head's cols
                 kr = mask.mean(0).view(nheads, hd).mean(1)     # [nheads]
-                ihcv.append((kr.std / (kr.mean + 1e-9)).item)
+                ihcv.append((kr.std() / (kr.mean() + 1e-9)).item())
             if hd and K % hd == 0 and (K // hd) == nheads and not is_o:
                 # OUTPUT channels head-partitioned (q/k/v): per-head keep-rate = mean over that head's rows
                 kro = mask.mean(1).view(nheads, hd).mean(1)
-                ohcv.append((kro.std / (kro.mean + 1e-9)).item)
-        torch.cuda.empty_cache
+                ohcv.append((kro.std() / (kro.mean() + 1e-9)).item())
+        torch.cuda.empty_cache()
     import statistics as st
     if ihcv:
         print(f"o_proj INPUT-head keep-rate CV: mean={st.mean(ihcv):.4f} max={max(ihcv):.4f} n={len(ihcv)}"
@@ -77,4 +77,4 @@ def main:
 
 
 if __name__ == "__main__":
-    main
+    main()

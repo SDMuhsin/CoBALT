@@ -54,7 +54,7 @@ def balanced_importance(W, act_norms, sparsity, col_exp):
     """CoBALT balanced importance + GLOBAL top-k mask (mirrors ns.balanced_mask_and_obs,
     row_fair=True, global scope), returns the boolean keep-mask. No OBS here."""
     K, N = W.shape
-    imp = W.abs * act_norms.view(1, -1)
+    imp = W.abs() * act_norms.view(1, -1)
     kr, kc = int(N * sparsity), int(K * sparsity)
     if kr > 0:
         qr = torch.kthvalue(imp, kr, dim=1, keepdim=True).values.clamp(min=1e-30)
@@ -66,7 +66,7 @@ def balanced_importance(W, act_norms, sparsity, col_exp):
 
 
 def wanda_importance(W, act_norms, sparsity):
-    imp = W.abs * act_norms.view(1, -1)
+    imp = W.abs() * act_norms.view(1, -1)
     return imp, ns._threshold_mask(imp, sparsity, scope='global')
 
 
@@ -88,17 +88,17 @@ def rtn_dequant(W_norm, mask, c, gsize):
     """Deployed endpoint group-RTN over survivors -> dequantized W_hat [K,N] (orig space)."""
     q, scales, zeros, _ = quantize_rtn(W_norm, [0, 2 ** NBITS - 1], group_size=gsize)
     K, N = W_norm.shape
-    if scales.dim == 3:
+    if scales.dim() == 3:
         ng = scales.shape[1]
         Wd = ((q.view(K, ng, N // ng) - zeros) * scales).reshape(K, N)
     else:
         Wd = (q - zeros) * scales
-    return Wd * c.view(1, -1) * mask.float
+    return Wd * c.view(1, -1) * mask.float()
 
 
 def eout(W_hat, W_dense, H):
-    D = (W_hat - W_dense).double
-    return float((D @ H.double * D).sum.item)
+    D = (W_hat - W_dense).double()
+    return float((D @ H.double() * D).sum().item())
 
 
 def grid_aware_swap_mask(W_norm, mask, energy, gsize, only_lowE=True):
@@ -111,7 +111,7 @@ def grid_aware_swap_mask(W_norm, mask, energy, gsize, only_lowE=True):
     only_lowE=False: swap the scale-setter unconditionally (upper bound on the lever).
     Returns (new_mask, n_fired). Operates per (row, group) block, vectorized over rows/groups."""
     K, N = W_norm.shape
-    m = mask.bool.clone
+    m = mask.bool().clone()
     grouped = N > gsize and N % gsize == 0
     if not grouped:
         return mask, 0
@@ -125,7 +125,7 @@ def grid_aware_swap_mask(W_norm, mask, energy, gsize, only_lowE=True):
     valid = Mg.any(-1, keepdim=True)
     mid = 0.5 * (w_min + w_max)
     # scale-setter s* = max |w-mid| among survivors; new hull half-range if s* removed = 2nd-largest dev.
-    dev = torch.where(Mg, (Wg - mid).abs, torch.full_like(Wg, -big))
+    dev = torch.where(Mg, (Wg - mid).abs(), torch.full_like(Wg, -big))
     top2 = dev.topk(2, dim=-1).values                                   # [K,ng,2]
     s_dev = top2[..., 0:1]
     new_half = top2[..., 1:2].clamp(min=0)                              # hull after dropping s*
@@ -136,7 +136,7 @@ def grid_aware_swap_mask(W_norm, mask, energy, gsize, only_lowE=True):
     # (|w-mid| <= new_half, so they do NOT re-extend the scale), pick the highest OUTPUT-ENERGY
     # one -- adds real output-error capacity while keeping the tight hull. (v1 promoted max-|w|,
     # which re-became the scale-setter and re-extended the hull => measured +33% WORSE on gemma.)
-    dev_p = (Wg - mid).abs
+    dev_p = (Wg - mid).abs()
     interior = (~Mg) & (dev_p <= new_half)
     cand_E = torch.where(interior, Eg, torch.full_like(Eg, -big))
     p_idx = cand_E.argmax(-1, keepdim=True)
@@ -145,7 +145,7 @@ def grid_aware_swap_mask(W_norm, mask, energy, gsize, only_lowE=True):
     if only_lowE:
         fire = fire & (ext_E < med_E)
     # apply: drop s*, add p* where fire
-    Mg_new = Mg.clone
+    Mg_new = Mg.clone()
     fire_row = fire.squeeze(-1)                                          # [K,ng]
     ar = torch.arange(K, device=W_norm.device).view(-1, 1).expand(K, ng)
     ag = torch.arange(ng, device=W_norm.device).view(1, -1).expand(K, ng)
@@ -154,21 +154,21 @@ def grid_aware_swap_mask(W_norm, mask, energy, gsize, only_lowE=True):
     pi = p_idx.squeeze(-1)[fire_row]
     Mg_new[fr, fg, si] = False
     Mg_new[fr, fg, pi] = True
-    return Mg_new.reshape(K, N).float, int(fire_row.sum.item)
+    return Mg_new.reshape(K, N).float(), int(fire_row.sum().item())
 
 
 def build_and_score(W, X, imp_fn, gsize, device):
     """Return dict of pooled tr(DHD^T) for: base RTN, grid-swap RTN, grid-swap-unconditional,
     awclip, plus diagnostics, for the given importance/mask function."""
-    Xa = X.float
-    if Xa.dim == 3:
+    Xa = X.float()
+    if Xa.dim() == 3:
         Xa = Xa.reshape(-1, Xa.shape[-1])
     Xa = Xa[:min(Xa.shape[0], CAP256)]
-    H = Xa.t @ Xa
+    H = Xa.t() @ Xa
     energy0 = (Xa * Xa).sum(0).clamp(min=0)                              # ||X_j||^2 [N]
     _, mask0 = imp_fn(W, torch.norm(Xa, dim=0))
     H_inv = compute_hessian_inverse(Xa, damping=None)
-    H_inv_diag = H_inv.diag
+    H_inv_diag = H_inv.diag()
 
     # --- base support: OBS, col-norm, RTN
     Wc0 = obs_compensate(W, mask0, H_inv, H_inv_diag)
@@ -181,7 +181,7 @@ def build_and_score(W, X, imp_fn, gsize, device):
     E_base = eout(Wd0, W_target0, H)
 
     # energy in NORMALIZED space for the scale-setter test: c^2 * ||X||^2
-    energy_norm = (c0.float ** 2) * energy0
+    energy_norm = (c0.float() ** 2) * energy0
 
     # --- grid-aware swap (low-energy scale-setter only) ---
     res = {"E_base": E_base}
@@ -196,23 +196,23 @@ def build_and_score(W, X, imp_fn, gsize, device):
         # score BOTH supports against the SAME dense (uncompensated) reference so E is comparable
         # across masks: reference = the true dense weight W (not the OBS target, which differs per
         # mask). tr((Wq - W) H (Wq - W)^T) is the honest output error vs the ORIGINAL layer.
-        res[f"E_{tag}"] = eout(Wd1, W.float, H)
+        res[f"E_{tag}"] = eout(Wd1, W.float(), H)
         res[f"nfire_{tag}"] = nfire
         if tag == "grid":
             # ORTHOGONALITY TEST: awclip (soft-clip scale) ON TOP of the grid-swapped support.
             # If this beats awclip-on-base, the grid MASK adds something awclip's scale cannot.
-            wcol1 = (c1.float ** 2) * energy0
+            wcol1 = (c1.float() ** 2) * energy0
             Wn1_ac = eq.awclip_quantize(Wn1, mask1, NBITS, gsize, wcol1)
-            Wd1_ac = Wn1_ac * c1.view(1, -1) * mask1.float
-            res["E_grid_awclip_vsW"] = eout(Wd1_ac, W.float, H)
+            Wd1_ac = Wn1_ac * c1.view(1, -1) * mask1.float()
+            res["E_grid_awclip_vsW"] = eout(Wd1_ac, W.float(), H)
     # base also scored against true dense W for apples-to-apples
-    res["E_base_vsW"] = eout(Wd0, W.float, H)
+    res["E_base_vsW"] = eout(Wd0, W.float(), H)
 
     # --- awclip on base support (soft-clip comparison) ---
-    wcol = (c0.float ** 2) * energy0
+    wcol = (c0.float() ** 2) * energy0
     Wn_ac = eq.awclip_quantize(Wn0, mask0, NBITS, gsize, wcol)
-    Wd_ac = Wn_ac * c0.view(1, -1) * mask0.float
-    res["E_awclip_vsW"] = eout(Wd_ac, W.float, H)
+    Wd_ac = Wn_ac * c0.view(1, -1) * mask0.float()
+    res["E_awclip_vsW"] = eout(Wd_ac, W.float(), H)
 
     # --- diagnostics: scale-setter low-energy prevalence, hull shrink ---
     res["ncols"] = W.shape[1]
@@ -233,7 +233,7 @@ def run_model(MODEL, device="cuda", gsize=128):
     acts_all = bs.collect_activations(model, cal, device)
     for _l in ns.get_layers(model):
         _l.to("cpu")
-    torch.cuda.empty_cache
+    torch.cuda.empty_cache()
 
     layer_paths = bs.get_layer_paths(model)
     layers = ns.get_layers(model)
@@ -270,7 +270,7 @@ def run_model(MODEL, device="cuda", gsize=128):
                 acts = acts_all.get(f'layer_{li}.{ap}')
                 if acts is None:
                     continue
-                W = lin.weight.data.float.to(device)
+                W = lin.weight.data.float().to(device)
                 if W.shape[1] % gsize != 0:
                     continue
                 r = build_and_score(W, acts.to(device), fn, gsize, device)
@@ -286,7 +286,7 @@ def run_model(MODEL, device="cuda", gsize=128):
                 acc["wins_awclip"] += int(r["E_awclip_vsW"] < r["E_base_vsW"])
                 acc["wins_stack"] += int(r["E_grid_awclip_vsW"] < r["E_awclip_vsW"])  # stack beats awclip?
             layers[li] = layer.to("cpu")
-            torch.cuda.empty_cache
+            torch.cuda.empty_cache()
         base = max(acc["E_base_vsW"], 1e-30)
         awc = max(acc["E_awclip_vsW"], 1e-30)
         stack_vs_awclip = acc["E_grid_awclip_vsW"] / awc      # <1 => grid MASK adds orthogonal gain
@@ -295,7 +295,7 @@ def run_model(MODEL, device="cuda", gsize=128):
               f"awclip={awc/base:.4f}  grid+awclip={acc['E_grid_awclip_vsW']/base:.4f}  | "
               f"STACK/awclip={stack_vs_awclip:.4f} (stack wins {acc['wins_stack']}/{acc['nmat']})  "
               f"grid wins {acc['wins_grid']}/{acc['nmat']}", flush=True)
-        agg[supp] = {k: (v / base if k.startswith("E_") else v) for k, v in acc.items}
+        agg[supp] = {k: (v / base if k.startswith("E_") else v) for k, v in acc.items()}
     # differential: does grid help balanced MORE than wanda? (CoBALT-specific test)
     d_bal = 1.0 - agg["balanced"]["E_grid"]
     d_wan = 1.0 - agg["wanda"]["E_grid"]
@@ -303,12 +303,12 @@ def run_model(MODEL, device="cuda", gsize=128):
           f"wanda={d_wan*100:+.2f}%  DIFFERENTIAL(bal-wan)={100*(d_bal-d_wan):+.2f}pp "
           f"{'<= CoBALT-specific' if d_bal-d_wan > 0.01 else '<= universal/none'}", flush=True)
     del model
-    torch.cuda.empty_cache
+    torch.cuda.empty_cache()
 
 
-def main:
+def main():
     global SP, BETA, NBITS
-    ap = argparse.ArgumentParser
+    ap = argparse.ArgumentParser()
     ap.add_argument("--models", default="gemma-2b,tinyllama,qwen-1.5b")
     ap.add_argument("--gsize", type=int, default=128)
     ap.add_argument("--sp", type=float, default=SP,
@@ -317,17 +317,17 @@ def main:
     ap.add_argument("--nbits", type=int, default=NBITS,
                     help="bit-width (awclip scale gain is far bigger at 2-bit => grid-mask may pay).")
     ap.add_argument("--beta", type=float, default=BETA)
-    args = ap.parse_args
+    args = ap.parse_args()
     SP, BETA, NBITS = args.sp, args.beta, args.nbits
     print(f"=== gridmask probe  sp={SP} beta={BETA} nbits={NBITS} g={args.gsize} ===", flush=True)
     for m in args.models.split(","):
         try:
-            run_model(m.strip, gsize=args.gsize)
+            run_model(m.strip(), gsize=args.gsize)
         except Exception as e:
             import traceback
             print(f"[{m}] FAILED: {e}", flush=True)
-            traceback.print_exc
+            traceback.print_exc()
 
 
 if __name__ == "__main__":
-    main
+    main()

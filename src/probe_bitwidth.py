@@ -24,10 +24,10 @@ BITS = [2, 3, 4]
 
 
 def rtn_D(W_comp, mask, r, c, nbits, block, W):
-    mm = [0, 2 ** nbits - 1]; mkf = mask.float
+    mm = [0, 2 ** nbits - 1]; mkf = mask.float()
     W_norm = W_comp / (r.view(-1, 1) * c.view(1, -1))
     q, s, z, _ = quantize_rtn(W_norm, mm, group_size=block)
-    s = (s * r.view(-1, 1, 1)) if s.dim == 3 else (s * r.view(-1, 1))
+    s = (s * r.view(-1, 1, 1)) if s.dim() == 3 else (s * r.view(-1, 1))
     s = torch.nan_to_num(s, nan=1e-4, posinf=6e4, neginf=1e-4).clamp(min=1e-8, max=6e4)
     return eq.dequant_deployed(q, s, z, mkf, c) - W
 
@@ -45,7 +45,7 @@ def run_model(MODEL, device="cuda"):
     except Exception as e:
         print(f"  [warn] ptb {repr(e)[:40]}", flush=True)
     for _l in ns.get_layers(model): _l.to("cpu")
-    torch.cuda.empty_cache
+    torch.cuda.empty_cache()
     HKEY = "ptb" if "ptb" in A else "fit"
     lp = bs.get_layer_paths(model); layers = ns.get_layers(model); nl = len(layers)
     sample = sorted(set([1, nl // 2, nl - 2]))
@@ -64,14 +64,14 @@ def run_model(MODEL, device="cuda"):
             if not isinstance(lin, torch.nn.Linear): continue
             key = f'layer_{li}.{ap}'
             if A["fit"].get(key) is None: continue
-            W = lin.weight.data.clone.float.to(device); K, N = W.shape
+            W = lin.weight.data.clone().float().to(device); K, N = W.shape
             block = bs._largest_divisor_leq(N, GROUP)
-            Xh = A[HKEY][key].to(device).float
-            if Xh.dim == 3: Xh = Xh.reshape(-1, Xh.shape[-1])
+            Xh = A[HKEY][key].to(device).float()
+            if Xh.dim() == 3: Xh = Xh.reshape(-1, Xh.shape[-1])
             Xh = Xh[:min(Xh.shape[0], CAP)]
-            H = Xh.t @ Xh
-            Xf = A["fit"][key].to(device).float
-            if Xf.dim == 3: Xf = Xf.reshape(-1, Xf.shape[-1])
+            H = Xh.t() @ Xh
+            Xf = A["fit"][key].to(device).float()
+            if Xf.dim() == 3: Xf = Xf.reshape(-1, Xf.shape[-1])
             Xf = Xf[:min(Xf.shape[0], CAP)]
             colE = (Xf * Xf).sum(0).clamp(min=0)
             X = A["fit"][key].to(device)
@@ -88,7 +88,7 @@ def run_model(MODEL, device="cuda"):
                     D_aw = eq.awclip_only(W_comp, mask, b, block, r, c, colE) - W
                     tot[mk][b]["rtn"] += out_err(D_rtn, H)
                     tot[mk][b]["awclip"] += out_err(D_aw, H)
-        layers[li] = layer.to("cpu"); torch.cuda.empty_cache
+        layers[li] = layer.to("cpu"); torch.cuda.empty_cache()
     print(f"  awclip held-out({HKEY}) GAIN vs RTN per nbits, and balance-differential (bal - wanda):", flush=True)
     for b in BITS:
         g = {mk: 1 - tot[mk][b]["awclip"] / tot[mk][b]["rtn"] for mk in MK}
@@ -98,11 +98,11 @@ def run_model(MODEL, device="cuda"):
               f"  Δ(bal-wan)={diff*100:+.1f}pt{flag}", flush=True)
 
 
-def main:
-    P = argparse.ArgumentParser; P.add_argument("--models", default="gemma-2b,tinyllama,qwen-1.5b")
-    Aa = P.parse_args
-    for m in Aa.models.split(","): run_model(m.strip)
+def main():
+    P = argparse.ArgumentParser(); P.add_argument("--models", default="gemma-2b,tinyllama,qwen-1.5b")
+    Aa = P.parse_args()
+    for m in Aa.models.split(","): run_model(m.strip())
 
 
 if __name__ == "__main__":
-    main
+    main()

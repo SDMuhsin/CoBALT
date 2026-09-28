@@ -48,16 +48,16 @@ def _apply(W_norm, s, z, gsize, mode, gen):
     elif mode == "dither":
         fl = torch.floor(xn); frac = xn - fl
         u = torch.rand(xn.shape, generator=gen, device=xn.device)
-        q = torch.clamp(fl + (u < frac).float, 0, NL); rec = (q - z) * s
+        q = torch.clamp(fl + (u < frac).float(), 0, NL); rec = (q - z) * s
     elif mode == "offset":
         q = torch.clamp(torch.round(xn - 0.5), 0, NL); rec = (q - z + 0.5) * s
     elif mode == "gauss":
         # nonuniform reconstruction levels: erfinv-spaced in [0,NL] mapped to value range
         idx = torch.arange(NL + 1, device=xn.device, dtype=torch.float32)
         p = (idx + 0.5) / (NL + 1)                    # (0,1)
-        g = torch.erfinv(2 * p - 1); g = (g - g.min) / (g.max - g.min) * NL  # [0,NL] nonuniform
+        g = torch.erfinv(2 * p - 1); g = (g - g.min()) / (g.max() - g.min()) * NL  # [0,NL] nonuniform
         # quantize xn to nearest uniform index, then reconstruct at gauss level of that index
-        qi = torch.clamp(torch.round(xn), 0, NL).long
+        qi = torch.clamp(torch.round(xn), 0, NL).long()
         recg = g[qi]                                  # nonuniform code value in [0,NL]
         rec = (recg - z) * s
     elif mode == "twogrid":
@@ -90,8 +90,8 @@ def run_model(MODEL, device="cuda"):
     except Exception as e:
         print(f"  [warn] ptb {repr(e)[:40]}", flush=True)
     for _l in ns.get_layers(model): _l.to("cpu")
-    torch.cuda.empty_cache
-    HK = list(A.keys)
+    torch.cuda.empty_cache()
+    HK = list(A.keys())
     lp = bs.get_layer_paths(model); layers = ns.get_layers(model); nl = len(layers)
     sample = sorted(set([1, nl // 2, nl - 2]))
     print(f"\n######## {MODEL} sample={sample} g={GROUP} H={HK} ########", flush=True)
@@ -111,16 +111,16 @@ def run_model(MODEL, device="cuda"):
             if not isinstance(lin, torch.nn.Linear): continue
             key = f'layer_{li}.{ap}'
             if A["fit"].get(key) is None: continue
-            W = lin.weight.data.clone.float.to(device); K, N = W.shape
+            W = lin.weight.data.clone().float().to(device); K, N = W.shape
             block = bs._largest_divisor_leq(N, GROUP)
             H = {}
             for hk in HK:
                 a = A[hk].get(key)
                 if a is None: H[hk] = None; continue
-                Xh = a.to(device).float
-                if Xh.dim == 3: Xh = Xh.reshape(-1, Xh.shape[-1])
+                Xh = a.to(device).float()
+                if Xh.dim() == 3: Xh = Xh.reshape(-1, Xh.shape[-1])
                 Xh = Xh[:min(Xh.shape[0], CAP)]
-                H[hk] = Xh.t @ Xh
+                H[hk] = Xh.t() @ Xh
             for mk in MK:
                 if mk == "balanced":
                     W_comp, mask = ns.balanced_mask_and_obs(W, A["fit"][key].to(device), SP, device, col_exp=BETA)
@@ -128,7 +128,7 @@ def run_model(MODEL, device="cuda"):
                     W_comp, mask = ns.wanda_mask_and_obs(W, A["fit"][key].to(device), SP, device, scope='per_row')
                 else:
                     W_comp, mask = magnitude_mask_and_obs(W, A["fit"][key].to(device), SP, device)
-                r, c = ns.compute_norm_scales(W_comp, mask, 'col', device); mkf = mask.float
+                r, c = ns.compute_norm_scales(W_comp, mask, 'col', device); mkf = mask.float()
                 rc = r.view(-1, 1) * c.view(1, -1)
                 W_norm = W_comp / rc
                 s, z = deployed_sz(W_norm, block)
@@ -139,7 +139,7 @@ def run_model(MODEL, device="cuda"):
                         if H[hk] is None: continue
                         tot[mk][e][hk] += out_err(D, H[hk])
             nmat += 1
-        layers[li] = layer.to("cpu"); torch.cuda.empty_cache
+        layers[li] = layer.to("cpu"); torch.cuda.empty_cache()
     print(f"  pooled {nmat} matrices/mask. GAIN = 1 - e/e_rtn (>0 = beats deployed RTN).", flush=True)
     for mk in MK:
         row = f"    {mk:<10}"
@@ -150,11 +150,11 @@ def run_model(MODEL, device="cuda"):
         print(row, flush=True)
 
 
-def main:
-    P = argparse.ArgumentParser; P.add_argument("--models", default="gemma-2b,tinyllama,qwen-1.5b")
-    Aa = P.parse_args
-    for m in Aa.models.split(","): run_model(m.strip)
+def main():
+    P = argparse.ArgumentParser(); P.add_argument("--models", default="gemma-2b,tinyllama,qwen-1.5b")
+    Aa = P.parse_args()
+    for m in Aa.models.split(","): run_model(m.strip())
 
 
 if __name__ == "__main__":
-    main
+    main()

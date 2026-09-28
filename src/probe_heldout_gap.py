@@ -55,14 +55,14 @@ AWZ_DELTAS = (-0.10, -0.05, 0.0, 0.05, 0.10)
 
 
 def out_err(D, H):
-    D = D.double
-    return float((D @ H.double * D).sum.item)
+    D = D.double()
+    return float((D @ H.double() * D).sum().item())
 
 
 def awclipz_quantize(W_norm, mask, nbits, gsize, wcol):
     """Joint per-group (SCALE, ZERO) output-weighted selection (fit on wcol=c^2*colE_fit)."""
     K, N = W_norm.shape
-    m = mask.bool
+    m = mask.bool()
     n_levels = 2 ** nbits - 1
     grouped = N > gsize and N % gsize == 0
     if grouped:
@@ -109,12 +109,12 @@ def collect(model, tok, device, dataset_key, n_samples, take_slice=None):
 def build_encodings(W, W_comp, mask, r, c, colE_fit, block, device):
     """Return {enc_name: D} where D = W_hat - W, all encodings FIT on colE_fit (X_fit)."""
     min_max = [0, 2 ** NBITS - 1]
-    mkf = mask.float
+    mkf = mask.float()
     out = {}
     # rtn (activation-independent)
     W_norm = W_comp / (r.view(-1, 1) * c.view(1, -1))
     q, s, z, _ = quantize_rtn(W_norm, min_max, group_size=block)
-    if s.dim == 3:
+    if s.dim() == 3:
         s = s * r.view(-1, 1, 1)
     else:
         s = s * r.view(-1, 1)
@@ -125,7 +125,7 @@ def build_encodings(W, W_comp, mask, r, c, colE_fit, block, device):
     W_ac = eq.awclip_only(W_comp, mask, NBITS, block, r, c, colE_fit)
     out["awclip"] = W_ac - W
     # awclipz (act-weighted scale+zero, fit on colE_fit)
-    wcol = (c.float ** 2) * colE_fit.float
+    wcol = (c.float() ** 2) * colE_fit.float()
     W_az = awclipz_quantize(W_norm, mkf, NBITS, block, wcol) * (r.view(-1, 1) * c.view(1, -1)) * mkf
     out["awclipz"] = W_az - W
     return out
@@ -153,13 +153,13 @@ def run_model(MODEL, device="cuda"):
 
     for _l in ns.get_layers(model):
         _l.to("cpu")
-    torch.cuda.empty_cache
+    torch.cuda.empty_cache()
 
     layer_paths = bs.get_layer_paths(model)
     layers = ns.get_layers(model)
     n_layers = len(layers)
     sample_layers = sorted(set([1, n_layers // 2, n_layers - 2]))
-    HKEYS = list(hess_sets.keys)
+    HKEYS = list(hess_sets.keys())
     ENCS = ["rtn", "awclip", "awclipz"]
     MASKS = ["balanced", "wanda"]
     print(f"\n######## {MODEL} layers={n_layers} sample={sample_layers} g={GROUP} "
@@ -184,7 +184,7 @@ def run_model(MODEL, device="cuda"):
             key = f'layer_{li}.{ap}'
             if acts_fit.get(key) is None:
                 continue
-            W = lin.weight.data.clone.float.to(device)
+            W = lin.weight.data.clone().float().to(device)
             K, N = W.shape
             block = bs._largest_divisor_leq(N, GROUP)
 
@@ -195,13 +195,13 @@ def run_model(MODEL, device="cuda"):
                 if a is None:
                     H[hk] = None
                     continue
-                Xh = a.to(device).float
-                if Xh.dim == 3:
+                Xh = a.to(device).float()
+                if Xh.dim() == 3:
                     Xh = Xh.reshape(-1, Xh.shape[-1])
                 Xh = Xh[:min(Xh.shape[0], CAP)]
-                H[hk] = Xh.t @ Xh
-            Xf = hess_sets["fit"][key].to(device).float
-            if Xf.dim == 3:
+                H[hk] = Xh.t() @ Xh
+            Xf = hess_sets["fit"][key].to(device).float()
+            if Xf.dim() == 3:
                 Xf = Xf.reshape(-1, Xf.shape[-1])
             Xf = Xf[:min(Xf.shape[0], CAP)]
             colE_fit = (Xf * Xf).sum(0).clamp(min=0)
@@ -221,7 +221,7 @@ def run_model(MODEL, device="cuda"):
                         tot[mkname][hk][e] += out_err(Ds[e], H[hk])
             nmat += 1
         layers[li] = layer.to("cpu")
-        torch.cuda.empty_cache
+        torch.cuda.empty_cache()
 
     # ---- report ----
     print(f"  pooled over {nmat} matrices. GAIN(enc) = 1 - e_enc/e_rtn on each Hessian.", flush=True)
@@ -261,13 +261,13 @@ def run_model(MODEL, device="cuda"):
                   f"  Δ={100*(gb-gw):+.1f}pt{flag}", flush=True)
 
 
-def main:
-    P = argparse.ArgumentParser
+def main():
+    P = argparse.ArgumentParser()
     P.add_argument("--models", default="gemma-2b,tinyllama,qwen-1.5b")
-    A = P.parse_args
+    A = P.parse_args()
     for m in A.models.split(","):
-        run_model(m.strip)
+        run_model(m.strip())
 
 
 if __name__ == "__main__":
-    main
+    main()

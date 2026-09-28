@@ -32,7 +32,7 @@ def shrink_energy(colE, mask, block, alpha):
     """Shrink per-column energy toward its group-mean over SURVIVOR columns, by alpha."""
     N = colE.shape[0]
     if not (N > block and N % block == 0):
-        gm = colE.mean
+        gm = colE.mean()
         return (1 - alpha) * colE + alpha * gm
     ng = N // block
     e = colE.view(ng, block)
@@ -56,8 +56,8 @@ def run_model(MODEL, device="cuda"):
     except Exception as e:
         print(f"  [warn] ptb unavailable {repr(e)[:60]}", flush=True)
     for _l in ns.get_layers(model): _l.to("cpu")
-    torch.cuda.empty_cache
-    HK = list(A.keys)
+    torch.cuda.empty_cache()
+    HK = list(A.keys())
     layer_paths = bs.get_layer_paths(model); layers = ns.get_layers(model); nl = len(layers)
     sample = sorted(set([1, nl // 2, nl - 2]))
     print(f"\n######## {MODEL} sample={sample} g={GROUP} H={HK} ########", flush=True)
@@ -77,27 +77,27 @@ def run_model(MODEL, device="cuda"):
             if not isinstance(lin, torch.nn.Linear): continue
             key = f'layer_{li}.{ap}'
             if A["fit"].get(key) is None: continue
-            W = lin.weight.data.clone.float.to(device); K, N = W.shape
+            W = lin.weight.data.clone().float().to(device); K, N = W.shape
             block = bs._largest_divisor_leq(N, GROUP)
             H = {}
             for hk in HK:
                 a = A[hk].get(key)
                 if a is None: H[hk] = None; continue
-                Xh = a.to(device).float
-                if Xh.dim == 3: Xh = Xh.reshape(-1, Xh.shape[-1])
+                Xh = a.to(device).float()
+                if Xh.dim() == 3: Xh = Xh.reshape(-1, Xh.shape[-1])
                 Xh = Xh[:min(Xh.shape[0], CAP)]
-                H[hk] = Xh.t @ Xh
-            Xf = A["fit"][key].to(device).float
-            if Xf.dim == 3: Xf = Xf.reshape(-1, Xf.shape[-1])
+                H[hk] = Xh.t() @ Xh
+            Xf = A["fit"][key].to(device).float()
+            if Xf.dim() == 3: Xf = Xf.reshape(-1, Xf.shape[-1])
             Xf = Xf[:min(Xf.shape[0], CAP)]
             colE = (Xf * Xf).sum(0).clamp(min=0)
             W_comp, mask = ns.balanced_mask_and_obs(W, A["fit"][key].to(device), SP, device, col_exp=BETA)
             r, c = ns.compute_norm_scales(W_comp, mask, 'col', device)
-            mkf = mask.float
+            mkf = mask.float()
             W_norm = W_comp / (r.view(-1, 1) * c.view(1, -1))
             # rtn anchor
             q, s, z, _ = quantize_rtn(W_norm, min_max, group_size=block)
-            s = (s * r.view(-1, 1, 1)) if s.dim == 3 else (s * r.view(-1, 1))
+            s = (s * r.view(-1, 1, 1)) if s.dim() == 3 else (s * r.view(-1, 1))
             s = torch.nan_to_num(s, nan=1e-4, posinf=6e4, neginf=1e-4).clamp(min=1e-8, max=6e4)
             D_rtn = eq.dequant_deployed(q, s, z, mkf, c) - W
             for hk in HK:
@@ -105,13 +105,13 @@ def run_model(MODEL, device="cuda"):
             # shrinkage clip per alpha
             for al in ALPHAS:
                 eshr = shrink_energy(colE, mask, block, al)
-                wcol = (c.float ** 2) * eshr.float
+                wcol = (c.float() ** 2) * eshr.float()
                 W_hat = eq.awclip_quantize(W_norm, mkf, NBITS, block, wcol) * (r.view(-1, 1) * c.view(1, -1)) * mkf
                 D = W_hat - W
                 for hk in HK:
                     if H[hk] is not None: tot[al][hk] += out_err(D, H[hk])
             nmat += 1
-        layers[li] = layer.to("cpu"); torch.cuda.empty_cache
+        layers[li] = layer.to("cpu"); torch.cuda.empty_cache()
     print(f"  pooled {nmat} matrices. GAIN(alpha,H) = 1 - e/e_rtn.  (alpha=0 == awclip)", flush=True)
     hdr = "    alpha  " + "".join(f"{('GAIN['+hk+']'):>13}" for hk in HK)
     print(hdr, flush=True)
@@ -129,11 +129,11 @@ def run_model(MODEL, device="cuda"):
     print(f"  >> best held-out({HK[-1]}) alpha={best_ptb_a} gain={best_ptb_g*100:+.1f}% vs awclip {g0*100:+.1f}%  => {verdict}", flush=True)
 
 
-def main:
-    P = argparse.ArgumentParser; P.add_argument("--models", default="gemma-2b,tinyllama,qwen-1.5b")
-    Aa = P.parse_args
-    for m in Aa.models.split(","): run_model(m.strip)
+def main():
+    P = argparse.ArgumentParser(); P.add_argument("--models", default="gemma-2b,tinyllama,qwen-1.5b")
+    Aa = P.parse_args()
+    for m in Aa.models.split(","): run_model(m.strip())
 
 
 if __name__ == "__main__":
-    main
+    main()

@@ -32,11 +32,11 @@ def colE_of(A, key, device):
     a = A.get(key)
     if a is None:
         return None
-    X = a.to(device).float
-    if X.dim == 3:
+    X = a.to(device).float()
+    if X.dim() == 3:
         X = X.reshape(-1, X.shape[-1])
     X = X[:min(X.shape[0], CAP)]
-    return (X * X).sum(0).clamp(min=0), X.t @ X
+    return (X * X).sum(0).clamp(min=0), X.t() @ X
 
 
 def run_model(MODEL, device="cuda"):
@@ -54,7 +54,7 @@ def run_model(MODEL, device="cuda"):
     except Exception as e:
         print(f"  [warn] ptb {repr(e)[:50]}", flush=True)
     for _l in ns.get_layers(model): _l.to("cpu")
-    torch.cuda.empty_cache
+    torch.cuda.empty_cache()
     EVAL = [k for k in ("ptb", "C") if k in fold]
     lp = bs.get_layer_paths(model); layers = ns.get_layers(model); nl = len(layers)
     sample = sorted(set([1, nl // 2, nl - 2]))
@@ -75,7 +75,7 @@ def run_model(MODEL, device="cuda"):
             if not isinstance(lin, torch.nn.Linear): continue
             key = f'layer_{li}.{ap}'
             if fold["A"].get(key) is None: continue
-            W = lin.weight.data.clone.float.to(device); K, N = W.shape
+            W = lin.weight.data.clone().float().to(device); K, N = W.shape
             block = bs._largest_divisor_leq(N, GROUP)
             eA = colE_of(fold["A"], key, device)
             eB = colE_of(fold["B"], key, device)
@@ -86,17 +86,17 @@ def run_model(MODEL, device="cuda"):
                 r_ = colE_of(fold[ev], key, device)
                 Hev[ev] = None if r_ is None else r_[1]
             W_comp, mask = ns.balanced_mask_and_obs(W, fold["A"][key].to(device), SP, device, col_exp=BETA)
-            r, c = ns.compute_norm_scales(W_comp, mask, 'col', device); mkf = mask.float
+            r, c = ns.compute_norm_scales(W_comp, mask, 'col', device); mkf = mask.float()
             W_norm = W_comp / (r.view(-1, 1) * c.view(1, -1))
             rc = r.view(-1, 1) * c.view(1, -1)
             # rtn
             q, s, z, _ = quantize_rtn(W_norm, mm, group_size=block)
-            s = (s * r.view(-1, 1, 1)) if s.dim == 3 else (s * r.view(-1, 1))
+            s = (s * r.view(-1, 1, 1)) if s.dim() == 3 else (s * r.view(-1, 1))
             s = torch.nan_to_num(s, nan=1e-4, posinf=6e4, neginf=1e-4).clamp(min=1e-8, max=6e4)
             D_rtn = eq.dequant_deployed(q, s, z, mkf, c) - W
             # awclip: select on colE_A ; cvclip: select on colE_B
-            wcolA = (c.float ** 2) * colE_A.float
-            wcolB = (c.float ** 2) * colE_B.float
+            wcolA = (c.float() ** 2) * colE_A.float()
+            wcolB = (c.float() ** 2) * colE_B.float()
             D_aw = eq.awclip_quantize(W_norm, mkf, NBITS, block, wcolA) * rc * mkf - W
             D_cv = eq.awclip_quantize(W_norm, mkf, NBITS, block, wcolB) * rc * mkf - W
             for ev in EVAL:
@@ -105,7 +105,7 @@ def run_model(MODEL, device="cuda"):
                 tot["awclip"][ev] += out_err(D_aw, Hev[ev])
                 tot["cvclip"][ev] += out_err(D_cv, Hev[ev])
             nmat += 1
-        layers[li] = layer.to("cpu"); torch.cuda.empty_cache
+        layers[li] = layer.to("cpu"); torch.cuda.empty_cache()
     print(f"  pooled {nmat} matrices. GAIN = 1 - e/e_rtn on each clean held-out Hessian.", flush=True)
     for ev in EVAL:
         gaw = 1 - tot["awclip"][ev] / tot["rtn"][ev]
@@ -114,11 +114,11 @@ def run_model(MODEL, device="cuda"):
         print(f"    eval={ev:<4} awclip={gaw*100:+.1f}%  cvclip={gcv*100:+.1f}%  Δ={100*(gcv-gaw):+.2f}pt{flag}", flush=True)
 
 
-def main:
-    P = argparse.ArgumentParser; P.add_argument("--models", default="gemma-2b,tinyllama,qwen-1.5b")
-    Aa = P.parse_args
-    for m in Aa.models.split(","): run_model(m.strip)
+def main():
+    P = argparse.ArgumentParser(); P.add_argument("--models", default="gemma-2b,tinyllama,qwen-1.5b")
+    Aa = P.parse_args()
+    for m in Aa.models.split(","): run_model(m.strip())
 
 
 if __name__ == "__main__":
-    main
+    main()

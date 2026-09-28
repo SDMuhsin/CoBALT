@@ -24,16 +24,16 @@ SPS = [0.5, 0.8]
 def spectrum_stats(comp):
     """rank@90/99% Frobenius energy as FRACTION of min(K,N); top-r energy share hint."""
     try:
-        sv = torch.linalg.svdvals(comp.float)
+        sv = torch.linalg.svdvals(comp.float())
     except Exception:
         return None
-    e = (sv ** 2); tot = e.sum.clamp(min=1e-30); cum = torch.cumsum(e, 0) / tot
+    e = (sv ** 2); tot = e.sum().clamp(min=1e-30); cum = torch.cumsum(e, 0) / tot
     d = float(min(comp.shape))
-    r90 = float((cum < 0.90).sum.item + 1) / d
-    r99 = float((cum < 0.99).sum.item + 1) / d
+    r90 = float((cum < 0.90).sum().item() + 1) / d
+    r99 = float((cum < 0.99).sum().item() + 1) / d
     # storage-relevant: energy captured by a rank that costs ~1.5% bpw. r_cheap ~ 0.02*min(K,N)
     rc = max(1, int(0.02 * min(comp.shape)))
-    ecap = float(cum[min(rc - 1, len(cum) - 1)].item)
+    ecap = float(cum[min(rc - 1, len(cum) - 1)].item())
     return r90, r99, ecap
 
 
@@ -46,7 +46,7 @@ def run_model(MODEL, device="cuda"):
     bs.move_embed_to_device(model, device)
     A = collect(model, tok, device, "wikitext2", 16)
     for _l in ns.get_layers(model): _l.to("cpu")
-    torch.cuda.empty_cache
+    torch.cuda.empty_cache()
     lp = bs.get_layer_paths(model); layers = ns.get_layers(model); nl = len(layers)
     sample = sorted(set([1, nl // 2, nl - 2]))
     print(f"\n######## {MODEL} sample={sample} ########", flush=True)
@@ -64,7 +64,7 @@ def run_model(MODEL, device="cuda"):
             if not isinstance(lin, torch.nn.Linear): continue
             key = f'layer_{li}.{ap}'
             if A.get(key) is None: continue
-            W = lin.weight.data.clone.float.to(device); K, N = W.shape
+            W = lin.weight.data.clone().float().to(device); K, N = W.shape
             X = A[key].to(device)
             for mk in MK:
                 for sp in SPS:
@@ -77,10 +77,10 @@ def run_model(MODEL, device="cuda"):
                     comp = (W_comp - W * mask)                 # OBS compensation only
                     st = spectrum_stats(comp)
                     if st is None: continue
-                    cshare = float(comp.norm / (W_comp.norm.clamp(min=1e-8)))
+                    cshare = float(comp.norm() / (W_comp.norm().clamp(min=1e-8)))
                     a = acc[mk][sp]
                     a["r90"] += st[0]; a["r99"] += st[1]; a["ecap"] += st[2]; a["cshare"] += cshare; a["n"] += 1
-        layers[li] = layer.to("cpu"); torch.cuda.empty_cache
+        layers[li] = layer.to("cpu"); torch.cuda.empty_cache()
     print(f"  OBS comp spectrum: rank@90/99% energy (frac of min(K,N); LOW=>low-rank), ecap=energy in", flush=True)
     print(f"  rank~2% (storage-cheap), cshare=||comp||/||survivor||:", flush=True)
     for mk in MK:
@@ -90,11 +90,11 @@ def run_model(MODEL, device="cuda"):
                   f"  cshare={a['cshare']/n:.3f}", flush=True)
 
 
-def main:
-    P = argparse.ArgumentParser; P.add_argument("--models", default="gemma-2b,tinyllama,qwen-1.5b")
-    Aa = P.parse_args
-    for m in Aa.models.split(","): run_model(m.strip)
+def main():
+    P = argparse.ArgumentParser(); P.add_argument("--models", default="gemma-2b,tinyllama,qwen-1.5b")
+    Aa = P.parse_args()
+    for m in Aa.models.split(","): run_model(m.strip())
 
 
 if __name__ == "__main__":
-    main
+    main()

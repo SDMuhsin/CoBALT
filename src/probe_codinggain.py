@@ -29,35 +29,35 @@ def coding_gain_bits(W_norm, mask, gsize):
     if not (N > gsize and N % gsize == 0):
         return None
     ng = N // gsize
-    Wg = W_norm.view(K, ng, gsize); Mg = mask.view(K, ng, gsize).float
+    Wg = W_norm.view(K, ng, gsize); Mg = mask.view(K, ng, gsize).float()
     out = []
     for g in range(ng):
         Wc = Wg[:, g, :]; Mc = Mg[:, g, :]                     # [K, gsize]
         cnt = Mc.sum(0)                                         # [gsize] survivors per column
         keep = cnt >= MINCO
-        if keep.sum < 4:
+        if keep.sum() < 4:
             continue
         Wc = Wc[:, keep]; Mc = Mc[:, keep]; cnt = cnt[keep]
         mu = (Wc * Mc).sum(0) / cnt
         Wcen = (Wc - mu.view(1, -1)) * Mc                      # 0 at pruned
-        C = Mc.t @ Mc                                        # co-survival counts [d,d]
-        S = Wcen.t @ Wcen
+        C = Mc.t() @ Mc                                        # co-survival counts [d,d]
+        S = Wcen.t() @ Wcen
         Sigma = S / C.clamp(min=1.0)
-        Sigma = 0.5 * (Sigma + Sigma.t)                     # symmetrize
+        Sigma = 0.5 * (Sigma + Sigma.t())                     # symmetrize
         d = Sigma.shape[0]
-        Sigma = Sigma + 1e-6 * Sigma.diag.mean * torch.eye(d, device=Sigma.device)
-        diag = Sigma.diag.clamp(min=1e-12)
+        Sigma = Sigma + 1e-6 * Sigma.diag().mean() * torch.eye(d, device=Sigma.device)
+        diag = Sigma.diag().clamp(min=1e-12)
         try:
             ev = torch.linalg.eigvalsh(Sigma)
         except Exception:
             continue
         # condition-number floor: eigenvalues below max_eig*1e-3 are noise, not structure
-        ev = ev.clamp(min=ev.max * 1e-3)
-        G = diag.mean / torch.exp(torch.log(ev).mean)
+        ev = ev.clamp(min=ev.max() * 1e-3)
+        G = diag.mean() / torch.exp(torch.log(ev).mean())
         out.append(0.5 * torch.log2(G.clamp(min=1e-6)))
     if not out:
         return None
-    return float(torch.stack(out).mean.item)
+    return float(torch.stack(out).mean().item())
 
 
 def run_model(MODEL, device="cuda"):
@@ -69,7 +69,7 @@ def run_model(MODEL, device="cuda"):
     bs.move_embed_to_device(model, device)
     A = collect(model, tok, device, "wikitext2", 16)
     for _l in ns.get_layers(model): _l.to("cpu")
-    torch.cuda.empty_cache
+    torch.cuda.empty_cache()
     lp = bs.get_layer_paths(model); layers = ns.get_layers(model); nl = len(layers)
     sample = sorted(set([1, nl // 2, nl - 2]))
     print(f"\n######## {MODEL} sample={sample} g={GROUP} ########", flush=True)
@@ -87,7 +87,7 @@ def run_model(MODEL, device="cuda"):
             if not isinstance(lin, torch.nn.Linear): continue
             key = f'layer_{li}.{ap}'
             if A.get(key) is None: continue
-            W = lin.weight.data.clone.float.to(device); K, N = W.shape
+            W = lin.weight.data.clone().float().to(device); K, N = W.shape
             block = bs._largest_divisor_leq(N, GROUP)
             X = A[key].to(device)
             for mk in MK:
@@ -102,7 +102,7 @@ def run_model(MODEL, device="cuda"):
                     W_norm = W_comp / (r.view(-1, 1) * c.view(1, -1))
                     v = coding_gain_bits(W_norm, mask, block)
                     if v is not None: acc[mk][sp][0] += v; acc[mk][sp][1] += 1
-        layers[li] = layer.to("cpu"); torch.cuda.empty_cache
+        layers[li] = layer.to("cpu"); torch.cuda.empty_cache()
     print(f"  ORACLE group-KLT coding gain (bits saved / weight; UPPER bound on any joint encoding):", flush=True)
     for mk in MK:
         row = f"    {mk:<10}"
@@ -112,11 +112,11 @@ def run_model(MODEL, device="cuda"):
         print(row, flush=True)
 
 
-def main:
-    P = argparse.ArgumentParser; P.add_argument("--models", default="gemma-2b,tinyllama,qwen-1.5b")
-    Aa = P.parse_args
-    for m in Aa.models.split(","): run_model(m.strip)
+def main():
+    P = argparse.ArgumentParser(); P.add_argument("--models", default="gemma-2b,tinyllama,qwen-1.5b")
+    Aa = P.parse_args()
+    for m in Aa.models.split(","): run_model(m.strip())
 
 
 if __name__ == "__main__":
-    main
+    main()

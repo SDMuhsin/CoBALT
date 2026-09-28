@@ -25,10 +25,10 @@ SP, BETA, NBITS, GROUP, CAP = 0.5, 0.5, 3, 128, 256
 
 def masses(D, H):
     """return (total tr(D H D^T), diag mass sum_k sum_j d_kj^2 H_jj)."""
-    D = D.double; Hd = H.double
-    total = float((D @ Hd * D).sum.item)
-    diagH = Hd.diag
-    diag = float(((D * D) * diagH.view(1, -1)).sum.item)
+    D = D.double(); Hd = H.double()
+    total = float((D @ Hd * D).sum().item())
+    diagH = Hd.diag()
+    diag = float(((D * D) * diagH.view(1, -1)).sum().item())
     return total, diag
 
 
@@ -45,8 +45,8 @@ def run_model(MODEL, device="cuda"):
     except Exception as e:
         print(f"  [warn] ptb {repr(e)[:50]}", flush=True)
     for _l in ns.get_layers(model): _l.to("cpu")
-    torch.cuda.empty_cache
-    HK = list(A.keys)
+    torch.cuda.empty_cache()
+    HK = list(A.keys())
     lp = bs.get_layer_paths(model); layers = ns.get_layers(model); nl = len(layers)
     sample = sorted(set([1, nl // 2, nl - 2]))
     print(f"\n######## {MODEL} sample={sample} g={GROUP} H={HK} ########", flush=True)
@@ -67,18 +67,18 @@ def run_model(MODEL, device="cuda"):
             if not isinstance(lin, torch.nn.Linear): continue
             key = f'layer_{li}.{ap}'
             if A["fit"].get(key) is None: continue
-            W = lin.weight.data.clone.float.to(device); K, N = W.shape
+            W = lin.weight.data.clone().float().to(device); K, N = W.shape
             block = bs._largest_divisor_leq(N, GROUP)
             H = {}
             for hk in HK:
                 a = A[hk].get(key)
                 if a is None: H[hk] = None; continue
-                Xh = a.to(device).float
-                if Xh.dim == 3: Xh = Xh.reshape(-1, Xh.shape[-1])
+                Xh = a.to(device).float()
+                if Xh.dim() == 3: Xh = Xh.reshape(-1, Xh.shape[-1])
                 Xh = Xh[:min(Xh.shape[0], CAP)]
-                H[hk] = Xh.t @ Xh
-            Xf = A["fit"][key].to(device).float
-            if Xf.dim == 3: Xf = Xf.reshape(-1, Xf.shape[-1])
+                H[hk] = Xh.t() @ Xh
+            Xf = A["fit"][key].to(device).float()
+            if Xf.dim() == 3: Xf = Xf.reshape(-1, Xf.shape[-1])
             Xf = Xf[:min(Xf.shape[0], CAP)]
             colE = (Xf * Xf).sum(0).clamp(min=0)
             for m in MK:
@@ -86,10 +86,10 @@ def run_model(MODEL, device="cuda"):
                     W_comp, mask = ns.balanced_mask_and_obs(W, A["fit"][key].to(device), SP, device, col_exp=BETA)
                 else:
                     W_comp, mask = ns.wanda_mask_and_obs(W, A["fit"][key].to(device), SP, device, scope='per_row')
-                r, c = ns.compute_norm_scales(W_comp, mask, 'col', device); mkf = mask.float
+                r, c = ns.compute_norm_scales(W_comp, mask, 'col', device); mkf = mask.float()
                 W_norm = W_comp / (r.view(-1, 1) * c.view(1, -1))
                 q, s, z, _ = quantize_rtn(W_norm, mm, group_size=block)
-                s = (s * r.view(-1, 1, 1)) if s.dim == 3 else (s * r.view(-1, 1))
+                s = (s * r.view(-1, 1, 1)) if s.dim() == 3 else (s * r.view(-1, 1))
                 s = torch.nan_to_num(s, nan=1e-4, posinf=6e4, neginf=1e-4).clamp(min=1e-8, max=6e4)
                 D_rtn = eq.dequant_deployed(q, s, z, mkf, c) - W
                 W_ac = eq.awclip_only(W_comp, mask, NBITS, block, r, c, colE)
@@ -100,7 +100,7 @@ def run_model(MODEL, device="cuda"):
                         t, d = masses(D, H[hk])
                         acc[m][e][hk][0] += t; acc[m][e][hk][1] += d
             nmat += 1
-        layers[li] = layer.to("cpu"); torch.cuda.empty_cache
+        layers[li] = layer.to("cpu"); torch.cuda.empty_cache()
     print(f"  pooled {nmat} matrices. offdiag_share = 1 - diag/total (fraction of output error", flush=True)
     print(f"  that only coordinated rounding can reduce; ~0 => rounding axis empty).", flush=True)
     for m in MK:
@@ -113,11 +113,11 @@ def run_model(MODEL, device="cuda"):
             print(row, flush=True)
 
 
-def main:
-    P = argparse.ArgumentParser; P.add_argument("--models", default="gemma-2b,tinyllama,qwen-1.5b")
-    Aa = P.parse_args
-    for mm_ in Aa.models.split(","): run_model(mm_.strip)
+def main():
+    P = argparse.ArgumentParser(); P.add_argument("--models", default="gemma-2b,tinyllama,qwen-1.5b")
+    Aa = P.parse_args()
+    for mm_ in Aa.models.split(","): run_model(mm_.strip())
 
 
 if __name__ == "__main__":
-    main
+    main()

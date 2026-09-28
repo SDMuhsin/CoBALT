@@ -27,18 +27,18 @@ def capture_hidden(model, batch):
     def mk(i):
         def h(mod, inp, out):
             o = out[0] if isinstance(out, tuple) else out
-            caps[i] = o.detach.float.cpu
+            caps[i] = o.detach().float().cpu()
         return h
     for i, l in enumerate(layers):
         hooks.append(l.register_forward_hook(mk(i)))
-    with torch.no_grad:
+    with torch.no_grad():
         model(batch.to(DEV))
-    for h in hooks: h.remove
+    for h in hooks: h.remove()
     return [caps[i] for i in range(len(layers))]
 
 
 def relerr(hq, hd):
-    return [float((a - b).norm / b.norm.clamp(min=1e-8)) for a, b in zip(hq, hd)]
+    return [float((a - b).norm() / b.norm().clamp(min=1e-8)) for a, b in zip(hq, hd)]
 
 
 def load(name):
@@ -62,9 +62,9 @@ def run_model(MODEL):
     print(f"\n######## {MODEL} sp={SP} nbits={NBITS} g={GROUP} beta={BETA} ########", flush=True)
 
     # dense reference
-    dense = load(name); dense.to(DEV); dense.eval
+    dense = load(name); dense.to(DEV); dense.eval()
     hd = capture_hidden(dense, rb)
-    del dense; torch.cuda.empty_cache
+    del dense; torch.cuda.empty_cache()
 
     CONFIGS = [("balanced", "rtn"), ("balanced", "awclip"), ("wanda", "rtn"), ("wanda", "awclip")]
     res = {}
@@ -76,13 +76,13 @@ def run_model(MODEL):
         else:
             kw.update(mask_mode="wanda", mask_scope="per_row")
         m, _ = ns.apply_wanda_obs_rtn(m, cal, NBITS, sp_by_type, DEV, **kw)
-        m.to(DEV); m.eval
+        m.to(DEV); m.eval()
         hq = capture_hidden(m, rb)
         re = relerr(hq, hd)
         ppl = float(bs.evaluate_perplexity(m, test, DEV))
         res[(mask, enc)] = (re, ppl)
         print(f"    {mask:<9} {enc:<7} final_relerr={re[-1]:.4f} mean_relerr={sum(re)/len(re):.4f} ppl={ppl:.4f}", flush=True)
-        del m; torch.cuda.empty_cache
+        del m; torch.cuda.empty_cache()
 
     # does awclip reduce propagated error MORE for balanced?
     def d(mask, i):
@@ -95,11 +95,11 @@ def run_model(MODEL):
           f"  {'<== balance BREAKS wall' if (fb>fw+0.005 or pplb>pplw+0.05) else '(balance-agnostic: wall holds)'}", flush=True)
 
 
-def main:
-    P = argparse.ArgumentParser; P.add_argument("--models", default="gemma-2b")
-    A = P.parse_args
-    for m in A.models.split(","): run_model(m.strip)
+def main():
+    P = argparse.ArgumentParser(); P.add_argument("--models", default="gemma-2b")
+    A = P.parse_args()
+    for m in A.models.split(","): run_model(m.strip())
 
 
 if __name__ == "__main__":
-    main
+    main()

@@ -21,7 +21,7 @@ DEV = "cuda"; SP = 0.6; BETA = 0.5
 def kmask(imp, sp):
     K, N = imp.shape
     kr, kc = int(N * sp), int(K * sp)
-    imp = imp.clone
+    imp = imp.clone()
     if kr > 0:
         imp = imp / torch.kthvalue(imp, kr, dim=1, keepdim=True).values.clamp(min=1e-30)
     if kc > 0:
@@ -31,8 +31,8 @@ def kmask(imp, sp):
 
 
 def jac(a, b):
-    a = a.bool; b = b.bool
-    return float((a & b).sum / (a | b).sum.clamp(min=1))
+    a = a.bool(); b = b.bool()
+    return float((a & b).sum() / (a | b).sum().clamp(min=1))
 
 
 def run(MODEL, n_calib):
@@ -42,7 +42,7 @@ def run(MODEL, n_calib):
         tok.pad_token = tok.eos_token
     torch.manual_seed(0)
     model = AutoModelForCausalLM.from_pretrained(name, torch_dtype=torch.bfloat16, device_map=DEV, low_cpu_mem_usage=True)
-    model.eval
+    model.eval()
     paths = bs.get_layer_paths(model)
     acts = {}
     for dk in ["wikitext2", "ptb", "c4"]:
@@ -54,7 +54,7 @@ def run(MODEL, n_calib):
             print(f"[{MODEL}] {dk} calib failed: {e}")
     for _l in ns.get_layers(model):
         _l.to("cpu")
-    torch.cuda.empty_cache
+    torch.cuda.empty_cache()
     dks = list(acts)
     jwp, jwc, jwmin = [], [], []
     corr_wp = []
@@ -70,25 +70,25 @@ def run(MODEL, n_calib):
             key = f'layer_{li}.{p}'
             if any(key not in acts[d] for d in dks):
                 continue
-            W = mod.weight.data.float.to(DEV)
+            W = mod.weight.data.float().to(DEV)
             xn = {}
             for d in dks:
-                X = acts[d][key].float.to(DEV)
-                if X.dim == 3:
+                X = acts[d][key].float().to(DEV)
+                if X.dim() == 3:
                     X = X.reshape(-1, X.shape[-1])
                 xn[d] = torch.norm(X[:min(X.shape[0], 256)], dim=0)
-            m_wiki = kmask(W.abs * xn['wikitext2'].view(1, -1), SP)
+            m_wiki = kmask(W.abs() * xn['wikitext2'].view(1, -1), SP)
             if 'ptb' in xn:
-                m_ptb = kmask(W.abs * xn['ptb'].view(1, -1), SP)
+                m_ptb = kmask(W.abs() * xn['ptb'].view(1, -1), SP)
                 jwp.append(jac(m_wiki, m_ptb))
-                a = xn['wikitext2'].argsort.argsort.float; b = xn['ptb'].argsort.argsort.float
+                a = xn['wikitext2'].argsort().argsort().float(); b = xn['ptb'].argsort().argsort().float()
                 corr_wp.append(float(torch.corrcoef(torch.stack([a, b]))[0, 1]))
             if 'c4' in xn:
-                jwc.append(jac(m_wiki, kmask(W.abs * xn['c4'].view(1, -1), SP)))
+                jwc.append(jac(m_wiki, kmask(W.abs() * xn['c4'].view(1, -1), SP)))
             xmin = torch.stack([xn[d] for d in dks]).min(0).values
-            jwmin.append(jac(m_wiki, kmask(W.abs * xmin.view(1, -1), SP)))
+            jwmin.append(jac(m_wiki, kmask(W.abs() * xmin.view(1, -1), SP)))
             del W
-        layer.to("cpu"); torch.cuda.empty_cache
+        layer.to("cpu"); torch.cuda.empty_cache()
 
     def mean(x):
         return sum(x) / len(x) if x else float('nan')
@@ -100,17 +100,17 @@ def run(MODEL, n_calib):
     print(f"  >>> robust-min mask {'REDUNDANT (skip)' if ov > 0.95 else 'DIFFERENT (worth a downstream smoke)'}")
 
 
-def main:
-    ap = argparse.ArgumentParser
+def main():
+    ap = argparse.ArgumentParser()
     ap.add_argument("--models", default="tinyllama,qwen-1.5b")
     ap.add_argument("--n-calib", type=int, default=16)
-    args = ap.parse_args
+    args = ap.parse_args()
     for m in args.models.split(","):
         try:
-            run(m.strip, args.n_calib)
+            run(m.strip(), args.n_calib)
         except Exception as e:
-            import traceback; traceback.print_exc; print(f"[{m}] FAIL {e}")
+            import traceback; traceback.print_exc(); print(f"[{m}] FAIL {e}")
 
 
 if __name__ == "__main__":
-    main
+    main()

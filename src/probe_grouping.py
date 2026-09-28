@@ -28,8 +28,8 @@ def group_rtn_mse(W_norm, mask, gsize):
     from eout_quant import dequant_deployed
     Wt = dequant_deployed(q, s, z, torch.ones_like(W_norm),
                           torch.ones(W_norm.shape[1], device=W_norm.device))
-    d = (Wt - W_norm) * mask.float
-    return float((d * d).sum.item)
+    d = (Wt - W_norm) * mask.float()
+    return float((d * d).sum().item())
 
 
 def run_model(MODEL, device="cuda"):
@@ -41,7 +41,7 @@ def run_model(MODEL, device="cuda"):
     bs.move_embed_to_device(model, device)
     A = collect(model, tok, device, "wikitext2", 16)
     for _l in ns.get_layers(model): _l.to("cpu")
-    torch.cuda.empty_cache
+    torch.cuda.empty_cache()
     lp = bs.get_layer_paths(model); layers = ns.get_layers(model); nl = len(layers)
     sample = sorted(set([1, nl // 2, nl - 2]))
     print(f"\n######## {MODEL} sample={sample} g={GROUP} ########", flush=True)
@@ -60,7 +60,7 @@ def run_model(MODEL, device="cuda"):
             if not isinstance(lin, torch.nn.Linear): continue
             key = f'layer_{li}.{ap}'
             if A.get(key) is None: continue
-            W = lin.weight.data.clone.float.to(device); K, N = W.shape
+            W = lin.weight.data.clone().float().to(device); K, N = W.shape
             block = bs._largest_divisor_leq(N, GROUP)
             if not (N > block and N % block == 0): continue
             for mk in MK:
@@ -72,10 +72,10 @@ def run_model(MODEL, device="cuda"):
                     W_comp, mask = magnitude_mask_and_obs(W, A[key].to(device), SP, device)
                 r, c = ns.compute_norm_scales(W_comp, mask, 'col', device)
                 W_norm = W_comp / (r.view(-1, 1) * c.view(1, -1))
-                mkf = mask.float
+                mkf = mask.float()
                 acc[mk]["contig"] += group_rtn_mse(W_norm, mask, block)
                 # colmax sort
-                colmax = W_norm.abs.amax(0)
+                colmax = W_norm.abs().amax(0)
                 perm = torch.argsort(colmax)
                 acc[mk]["colmax"] += group_rtn_mse(W_norm[:, perm], mask[:, perm], block)
                 # colkurt sort (per-column 4th moment over rows, survivors)
@@ -88,18 +88,18 @@ def run_model(MODEL, device="cuda"):
                 perm2 = torch.argsort(kurt)
                 acc[mk]["colkurt"] += group_rtn_mse(W_norm[:, perm2], mask[:, perm2], block)
             nmat += 1
-        layers[li] = layer.to("cpu"); torch.cuda.empty_cache
+        layers[li] = layer.to("cpu"); torch.cuda.empty_cache()
     print(f"  pooled {nmat} matrices/mask. group-RTN weight-MSE ratio vs contiguous (<1 => grouping helps).", flush=True)
     for mk in MK:
         base = acc[mk]["contig"]
         print(f"    {mk:<10} colmax={acc[mk]['colmax']/base:.4f}  colkurt={acc[mk]['colkurt']/base:.4f}", flush=True)
 
 
-def main:
-    P = argparse.ArgumentParser; P.add_argument("--models", default="gemma-2b,tinyllama,qwen-1.5b")
-    Aa = P.parse_args
-    for m in Aa.models.split(","): run_model(m.strip)
+def main():
+    P = argparse.ArgumentParser(); P.add_argument("--models", default="gemma-2b,tinyllama,qwen-1.5b")
+    Aa = P.parse_args()
+    for m in Aa.models.split(","): run_model(m.strip())
 
 
 if __name__ == "__main__":
-    main
+    main()

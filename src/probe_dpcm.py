@@ -31,7 +31,7 @@ def dpcm_quant(W_norm, mask, gsize, rho):
     if not (N > gsize and N % gsize == 0):
         return None
     ng = N // gsize
-    Wg = W_norm.view(K, ng, gsize); Mg = mask.view(K, ng, gsize).bool
+    Wg = W_norm.view(K, ng, gsize); Mg = mask.view(K, ng, gsize).bool()
     # per-group residual scale/zero from OPEN-loop residuals over survivors
     prev = torch.zeros(K, ng, device=W_norm.device)
     R = torch.empty_like(Wg)
@@ -70,7 +70,7 @@ def run_model(MODEL, device="cuda"):
     except Exception as e:
         print(f"  [warn] ptb {repr(e)[:40]}", flush=True)
     for _l in ns.get_layers(model): _l.to("cpu")
-    torch.cuda.empty_cache
+    torch.cuda.empty_cache()
     HKEY = "ptb" if "ptb" in A else "fit"
     lp = bs.get_layer_paths(model); layers = ns.get_layers(model); nl = len(layers)
     sample = sorted(set([1, nl // 2, nl - 2]))
@@ -89,12 +89,12 @@ def run_model(MODEL, device="cuda"):
             if not isinstance(lin, torch.nn.Linear): continue
             key = f'layer_{li}.{ap}'
             if A["fit"].get(key) is None: continue
-            W = lin.weight.data.clone.float.to(device); K, N = W.shape
+            W = lin.weight.data.clone().float().to(device); K, N = W.shape
             block = bs._largest_divisor_leq(N, GROUP)
-            Xh = A[HKEY][key].to(device).float
-            if Xh.dim == 3: Xh = Xh.reshape(-1, Xh.shape[-1])
+            Xh = A[HKEY][key].to(device).float()
+            if Xh.dim() == 3: Xh = Xh.reshape(-1, Xh.shape[-1])
             Xh = Xh[:min(Xh.shape[0], CAP)]
-            H = Xh.t @ Xh
+            H = Xh.t() @ Xh
             X = A["fit"][key].to(device)
             for mk in MK:
                 for sp in SPS:
@@ -104,7 +104,7 @@ def run_model(MODEL, device="cuda"):
                         W_comp, mask = ns.wanda_mask_and_obs(W, X, sp, device, scope='per_row')
                     else:
                         W_comp, mask = magnitude_mask_and_obs(W, X, sp, device)
-                    r, c = ns.compute_norm_scales(W_comp, mask, 'col', device); mkf = mask.float
+                    r, c = ns.compute_norm_scales(W_comp, mask, 'col', device); mkf = mask.float()
                     rc = r.view(-1, 1) * c.view(1, -1)
                     W_norm = W_comp / rc
                     for rho in RHOS:
@@ -112,7 +112,7 @@ def run_model(MODEL, device="cuda"):
                         if Wh is None: continue
                         D = Wh * rc * mkf - W
                         tot[mk][sp][rho] += out_err(D, H)
-        layers[li] = layer.to("cpu"); torch.cuda.empty_cache
+        layers[li] = layer.to("cpu"); torch.cuda.empty_cache()
     print(f"  DPCM held-out({HKEY}) GAIN = 1 - e(rho)/e(rho=0); rho=0 is deployed RTN. best rho per cell:", flush=True)
     for mk in MK:
         row = f"    {mk:<10}"
@@ -123,11 +123,11 @@ def run_model(MODEL, device="cuda"):
         print(row, flush=True)
 
 
-def main:
-    P = argparse.ArgumentParser; P.add_argument("--models", default="gemma-2b,tinyllama,qwen-1.5b")
-    Aa = P.parse_args
-    for m in Aa.models.split(","): run_model(m.strip)
+def main():
+    P = argparse.ArgumentParser(); P.add_argument("--models", default="gemma-2b,tinyllama,qwen-1.5b")
+    Aa = P.parse_args()
+    for m in Aa.models.split(","): run_model(m.strip())
 
 
 if __name__ == "__main__":
-    main
+    main()

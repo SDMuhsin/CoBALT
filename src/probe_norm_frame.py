@@ -23,15 +23,15 @@ def group_kurt(W_norm, mask, gsize):
     K, N = W_norm.shape
     if not (N > gsize and N % gsize == 0):
         return None
-    Wg = W_norm.view(K, N // gsize, gsize); Mg = mask.view(K, N // gsize, gsize).bool
+    Wg = W_norm.view(K, N // gsize, gsize); Mg = mask.view(K, N // gsize, gsize).bool()
     cnt = Mg.sum(-1, keepdim=True).clamp(min=1.0)
     mu = torch.where(Mg, Wg, torch.zeros_like(Wg)).sum(-1, keepdim=True) / cnt
-    A = torch.where(Mg, (Wg - mu).abs, torch.zeros_like(Wg)).amax(-1, keepdim=True).clamp(min=1e-8)
+    A = torch.where(Mg, (Wg - mu).abs(), torch.zeros_like(Wg)).amax(-1, keepdim=True).clamp(min=1e-8)
     t = ((Wg - mu) / A).clamp(-1, 1)
-    return t[Mg].detach
+    return t[Mg].detach()
 
 
-def main:
+def main():
     device = "cuda"
     name = bs.MODELS[MODEL]
     tok = AutoTokenizer.from_pretrained(name)
@@ -43,7 +43,7 @@ def main:
     bs.move_embed_to_device(model, device)
     acts_all = bs.collect_activations(model, cal, device)
     for _l in ns.get_layers(model): _l.to("cpu")
-    torch.cuda.empty_cache
+    torch.cuda.empty_cache()
     layer_paths = bs.get_layer_paths(model)
     n_layers = len(ns.get_layers(model))
     sample = sorted(set([0, n_layers // 2, n_layers - 1]))
@@ -62,29 +62,29 @@ def main:
             if not isinstance(lin, torch.nn.Linear): continue
             acts = acts_all.get(f'layer_{li}.{ap}')
             if acts is None: continue
-            W = lin.weight.data.clone
+            W = lin.weight.data.clone()
             W_comp, mask = ns.balanced_mask_and_obs(W, acts.to(device), SP, device, col_exp=BETA)
-            Xa = acts.to(device).float
-            if Xa.dim == 3: Xa = Xa.reshape(-1, Xa.shape[-1])
-            act_abs = Xa[:min(Xa.shape[0], 256)].abs.mean(0)
+            Xa = acts.to(device).float()
+            if Xa.dim() == 3: Xa = Xa.reshape(-1, Xa.shape[-1])
+            act_abs = Xa[:min(Xa.shape[0], 256)].abs().mean(0)
             for nm in NORMS:
                 r, c = ns.compute_norm_scales(W_comp, mask, nm, device, act_abs=act_abs, awq_alpha=0.5)
                 W_norm = W_comp / (r.view(-1, 1) * c.view(1, -1))
                 t = group_kurt(W_norm, mask, GROUP)
                 if t is not None: pools[nm].append(t)
-        layers[li] = layer.to("cpu"); torch.cuda.empty_cache
+        layers[li] = layer.to("cpu"); torch.cuda.empty_cache()
 
     def kurt(x):
-        x = x.float; m = x.mean; s = x.std.clamp(min=1e-12)
-        return float(((x - m) / s).pow(4).mean)
+        x = x.float(); m = x.mean(); s = x.std().clamp(min=1e-12)
+        return float(((x - m) / s).pow(4).mean())
     print(f"\n[{MODEL}] per-group-affine survivor kurtosis under in-scope normalizations "
           f"(uniform=1.8, gaussian=3.0):", flush=True)
     for nm in NORMS:
         T = torch.cat(pools[nm])
-        print(f"  c={nm:<5} kurtosis={kurt(T):.3f}  std={T.std:.4f}  n={T.numel}", flush=True)
+        print(f"  c={nm:<5} kurtosis={kurt(T):.3f}  std={T.std():.4f}  n={T.numel()}", flush=True)
     print("[verdict] if all ~1.8 => uniformity ROBUST to normalization frame (foreclosure holds "
           "for grid-shaping); if some >>2.5 => a c exists where survivors are shapeable.", flush=True)
 
 
 if __name__ == "__main__":
-    main
+    main()

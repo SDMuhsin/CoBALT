@@ -46,7 +46,7 @@ def dequant_cobalt(W, X, sp, device):
     r, c = ns.compute_norm_scales(W_comp, mask, "col", device)
     W_norm = W_comp / (r.view(-1, 1) * c.view(1, -1))
     q, scales, zeros, _ = quantize_rtn(W_norm, [0, 2 ** NBITS - 1], group_size=GSIZE)
-    if scales.dim == 3:
+    if scales.dim() == 3:
         scales = scales * r.view(-1, 1, 1)
     else:
         scales = scales * r.view(-1, 1)
@@ -55,24 +55,24 @@ def dequant_cobalt(W, X, sp, device):
     K, N = W_comp.shape
     meta = {'sparsity': sp, 'nbits': NBITS, 'requested_nbits': NBITS,
             'group_size': GSIZE, 'shape': (K, N), 'method': 'wanda_obs_rtn_col'}
-    W_hat = bs.dequantize_sparse_sinq(q.half, scales.half, zeros.half,
-                                      mask.half, c.half, meta).float
+    W_hat = bs.dequantize_sparse_sinq(q.half(), scales.half(), zeros.half(),
+                                      mask.half(), c.half(), meta).float()
     return W_hat
 
 
 def err(W_hat, W, H):
     """tr(D H D^T), D = W_hat - W, H [N,N]. Normalized by tr(W H W^T) (relative output energy)."""
-    D = (W_hat - W).float
+    D = (W_hat - W).float()
     num = torch.einsum('kn,nm,km->', D, H, D)
     den = torch.einsum('kn,nm,km->', W, H, W).clamp(min=1e-30)
     return float(num / den), float(num)
 
 
 def gram(Xdict, key, device):
-    X = Xdict[key].float.to(device)
-    if X.dim == 3:
+    X = Xdict[key].float().to(device)
+    if X.dim() == 3:
         X = X.reshape(-1, X.shape[-1])
-    return X.t @ X
+    return X.t() @ X
 
 
 def water_fill(e_by_sp, weights, numel, target_sp, sps):
@@ -117,7 +117,7 @@ def run(MODEL, n_calib):
     torch.manual_seed(0)
     model = AutoModelForCausalLM.from_pretrained(name, torch_dtype=torch.bfloat16,
                                                  device_map=DEV, low_cpu_mem_usage=True)
-    model.eval
+    model.eval()
     layers = bs.get_transformer_layers(model)
     paths = bs.get_layer_paths(model)
 
@@ -139,25 +139,25 @@ def run(MODEL, n_calib):
     def mk(k):
         def h(mod, inp, out):
             o = out[0] if isinstance(out, tuple) else out
-            o.retain_grad; caps[k] = o
+            o.retain_grad(); caps[k] = o
         return h
-    for k, mod in targets.items:
+    for k, mod in targets.items():
         hooks.append(mod.register_forward_hook(mk(k)))
     sens_batch = bs.get_calibration_data(tok, n_samples=1, seq_len=256, dataset_key="wikitext2").to(DEV)
     out = model(sens_batch, labels=sens_batch)
-    out.loss.backward
+    out.loss.backward()
     s_m = {}
-    for k, o in caps.items:
+    for k, o in caps.items():
         g = o.grad
         if g is None:
             s_m[k] = 0.0; continue
-        g = g.reshape(-1, g.shape[-1]).float
-        s_m[k] = float((g * g).sum(-1).mean)   # E||grad||^2 over tokens
+        g = g.reshape(-1, g.shape[-1]).float()
+        s_m[k] = float((g * g).sum(-1).mean())   # E||grad||^2 over tokens
     for hk in hooks:
-        hk.remove
+        hk.remove()
     model.zero_grad(set_to_none=True)
     del caps, out, sens_batch
-    torch.cuda.empty_cache
+    torch.cuda.empty_cache()
 
     # ---- activations: fit (calib) + disjoint held-out ----
     torch.manual_seed(1)
@@ -168,7 +168,7 @@ def run(MODEL, n_calib):
     Xheld = bs.collect_activations(model, cal_held, DEV)
     for _l in ns.get_layers(model):
         _l.to("cpu")
-    torch.cuda.empty_cache
+    torch.cuda.empty_cache()
 
     # ---- per-matrix e_m(sp) on H_fit and H_held ----
     rows = []  # (key, K, numel, s_over_K, [e_fit per sp], [e_held per sp])
@@ -186,7 +186,7 @@ def run(MODEL, n_calib):
             key = f'layer_{li}.{p}'
             if key not in Xfit or key not in Xheld:
                 continue
-            W = mod.weight.data.float.to(DEV)
+            W = mod.weight.data.float().to(DEV)
             K, N = W.shape
             Hf = gram(Xfit, key, DEV)
             Hh = gram(Xheld, key, DEV)
@@ -196,10 +196,10 @@ def run(MODEL, n_calib):
                 rf, _ = err(W_hat, W, Hf)
                 rh, _ = err(W_hat, W, Hh)
                 ef.append(rf); eh.append(rh)
-            rows.append((key, K, W.numel, s_m.get(key, 0.0) / max(K, 1), ef, eh))
+            rows.append((key, K, W.numel(), s_m.get(key, 0.0) / max(K, 1), ef, eh))
             del W, Hf, Hh
-            torch.cuda.empty_cache
-        layer.to("cpu"); torch.cuda.empty_cache
+            torch.cuda.empty_cache()
+        layer.to("cpu"); torch.cuda.empty_cache()
 
     # ---- allocation experiment ----
     keys = [r[0] for r in rows]
@@ -252,18 +252,18 @@ def run(MODEL, n_calib):
     return results
 
 
-def main:
-    ap = argparse.ArgumentParser
+def main():
+    ap = argparse.ArgumentParser()
     ap.add_argument("--models", default="gemma-2b,tinyllama,qwen-1.5b")
     ap.add_argument("--n-calib", type=int, default=16)
-    args = ap.parse_args
+    args = ap.parse_args()
     for m in args.models.split(","):
         try:
-            run(m.strip, args.n_calib)
+            run(m.strip(), args.n_calib)
         except Exception as e:
-            import traceback; traceback.print_exc
+            import traceback; traceback.print_exc()
             print(f"[{m}] FAILED: {e}")
 
 
 if __name__ == "__main__":
-    main
+    main()

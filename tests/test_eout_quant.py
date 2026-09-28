@@ -25,9 +25,9 @@ torch.manual_seed(0)
 def make_layer(K=64, N=256, T=128, sparsity=0.6, gsize=64):
     W = torch.randn(K, N)
     X = torch.randn(T, N) * (0.5 + torch.rand(N))  # heteroscedastic columns
-    imp = W.abs * X.norm(dim=0)
-    thresh = imp.flatten.kthvalue(int(K * N * sparsity)).values
-    mask = (imp > thresh).float
+    imp = W.abs() * X.norm(dim=0)
+    thresh = imp.flatten().kthvalue(int(K * N * sparsity)).values
+    mask = (imp > thresh).float()
     W_comp = W * mask  # stand-in for OBS output (zeros off-support)
     return W_comp, mask, X
 
@@ -35,7 +35,7 @@ def make_layer(K=64, N=256, T=128, sparsity=0.6, gsize=64):
 def deployed_rtn(W_comp, mask, nbits, gsize, r, c):
     W_norm = W_comp / (r.view(-1, 1) * c.view(1, -1))
     q, scales, zeros, _ = quantize_rtn(W_norm, [0, 2 ** nbits - 1], group_size=gsize)
-    if scales.dim == 3:
+    if scales.dim() == 3:
         scales = scales * r.view(-1, 1, 1)
     else:
         scales = scales * r.view(-1, 1)
@@ -44,19 +44,19 @@ def deployed_rtn(W_comp, mask, nbits, gsize, r, c):
     return q, scales, zeros
 
 
-def test_dequant_parity:
-    W_comp, mask, X = make_layer
+def test_dequant_parity():
+    W_comp, mask, X = make_layer()
     K, N = W_comp.shape
     r, c = torch.ones(K), torch.ones(N)
     q, s, z = deployed_rtn(W_comp, mask, 3, 64, r, c)
     ours = eq.dequant_deployed(q, s, z, mask, c)
     meta = {"group_size": 64}
     ref = dequantize_sparse_sinq(q, s, z, mask, c.view(1, -1), meta)
-    assert torch.allclose(ours, ref, atol=1e-5), (ours - ref).abs.max
-    print("PASS dequant parity, max |diff| =", (ours - ref).abs.max.item)
+    assert torch.allclose(ours, ref, atol=1e-5), (ours - ref).abs().max()
+    print("PASS dequant parity, max |diff| =", (ours - ref).abs().max().item())
 
 
-def test_arms_and_guarantee:
+def test_arms_and_guarantee():
     for sp in (0.4, 0.6, 0.8):
         W_comp, mask, X = make_layer(sparsity=sp)
         K, N = W_comp.shape
@@ -70,7 +70,7 @@ def test_arms_and_guarantee:
         for arm in ("repack", "eout"):
             W_best, info = eq.eout_requantize(W_comp, mask, X, 3, 64, r, c,
                                               q2, s2, z2, arm=arm)
-            assert torch.isfinite(W_best).all
+            assert torch.isfinite(W_best).all()
             assert info["e_arm"] == info["e_arm"]  # not NaN
             if arm == "eout":
                 assert info["e_arm"] <= info["e_rtn"] * (1 + 1e-9), info
@@ -80,17 +80,17 @@ def test_arms_and_guarantee:
                   f"rel={info['e_arm']/max(info['e_rtn'],1e-30):.4f}")
 
 
-def test_descent_monotone:
+def test_descent_monotone():
     W_comp, mask, X = make_layer(sparsity=0.6)
     K, N = W_comp.shape
     r, c = torch.ones(K), torch.ones(N)
     q, s, z = deployed_rtn(W_comp, mask, 3, 64, r, c)
-    H = X.t @ X
+    H = X.t() @ X
     bprime, _ = eq.budget_width(mask, 3, 64)
     e_prev = eq.eout_sq(eq.dequant_deployed(q, s, z, mask, c), W_comp, H)
-    qq = q.float
+    qq = q.float()
     for p in range(3):
-        qq = eq.code_descent(qq, s.float, z.float, mask, r, c, W_comp, H,
+        qq = eq.code_descent(qq, s.float(), z.float(), mask, r, c, W_comp, H,
                              bprime, 64, passes=1)
         e_now = eq.eout_sq(eq.dequant_deployed(qq, s, z, mask, c), W_comp, H)
         assert e_now <= e_prev * (1 + 1e-9), (p, e_prev, e_now)
@@ -98,7 +98,7 @@ def test_descent_monotone:
         e_prev = e_now
 
 
-def test_budget_width:
+def test_budget_width():
     mask = torch.zeros(64, 256)
     mask[:, :64] = 1  # first group of each row survives fully -> k = 64*64
     bprime, k = eq.budget_width(mask, 3, 64)
@@ -110,8 +110,8 @@ def test_budget_width:
 
 
 if __name__ == "__main__":
-    test_dequant_parity
-    test_budget_width
-    test_descent_monotone
-    test_arms_and_guarantee
+    test_dequant_parity()
+    test_budget_width()
+    test_descent_monotone()
+    test_arms_and_guarantee()
     print("ALL PASS")

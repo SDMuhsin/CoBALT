@@ -30,17 +30,17 @@ SP, BETA, NBITS, GROUP, CAP = 0.5, 0.5, 3, 128, 256
 
 
 def col_count_cov(mask):
-    n = mask.float.sum(0)                      # [N] survivors per column
+    n = mask.float().sum(0)                      # [N] survivors per column
     nz = n[n > 0]
-    if nz.numel == 0:
+    if nz.numel() == 0:
         return 0.0
-    return float((nz.std / nz.mean.clamp(min=1e-8)).item)
+    return float((nz.std() / nz.mean().clamp(min=1e-8)).item())
 
 
 def dcrm_quantize(W_norm, mask, nbits, gsize):
     """Per-column DC removal + group RTN of the residual. m_j = survivor-mean per column."""
-    K, N = W_norm.shape; m = mask.bool
-    cnt = m.float.sum(0).clamp(min=1.0)                       # [N]
+    K, N = W_norm.shape; m = mask.bool()
+    cnt = m.float().sum(0).clamp(min=1.0)                       # [N]
     mj = torch.where(m, W_norm, torch.zeros_like(W_norm)).sum(0) / cnt   # [N] per-col survivor mean
     Wc = W_norm - mj.view(1, -1)
     q, s, z, _ = quantize_rtn(Wc, [0, 2 ** nbits - 1], group_size=gsize)
@@ -61,8 +61,8 @@ def run_model(MODEL, device="cuda"):
     except Exception as e:
         print(f"  [warn] ptb {repr(e)[:50]}", flush=True)
     for _l in ns.get_layers(model): _l.to("cpu")
-    torch.cuda.empty_cache
-    HK = list(A.keys)
+    torch.cuda.empty_cache()
+    HK = list(A.keys())
     lp = bs.get_layer_paths(model); layers = ns.get_layers(model); nl = len(layers)
     sample = sorted(set([1, nl // 2, nl - 2]))
     print(f"\n######## {MODEL} sample={sample} g={GROUP} H={HK} ########", flush=True)
@@ -83,16 +83,16 @@ def run_model(MODEL, device="cuda"):
             if not isinstance(lin, torch.nn.Linear): continue
             key = f'layer_{li}.{ap}'
             if A["fit"].get(key) is None: continue
-            W = lin.weight.data.clone.float.to(device); K, N = W.shape
+            W = lin.weight.data.clone().float().to(device); K, N = W.shape
             block = bs._largest_divisor_leq(N, GROUP)
             H = {}
             for hk in HK:
                 a = A[hk].get(key)
                 if a is None: H[hk] = None; continue
-                Xh = a.to(device).float
-                if Xh.dim == 3: Xh = Xh.reshape(-1, Xh.shape[-1])
+                Xh = a.to(device).float()
+                if Xh.dim() == 3: Xh = Xh.reshape(-1, Xh.shape[-1])
                 Xh = Xh[:min(Xh.shape[0], CAP)]
-                H[hk] = Xh.t @ Xh
+                H[hk] = Xh.t() @ Xh
             for mk in MK:
                 if mk == "balanced":
                     W_comp, mask = ns.balanced_mask_and_obs(W, A["fit"][key].to(device), SP, device, col_exp=BETA)
@@ -101,11 +101,11 @@ def run_model(MODEL, device="cuda"):
                 else:
                     W_comp, mask = magnitude_mask_and_obs(W, A["fit"][key].to(device), SP, device)
                 cov[mk] += col_count_cov(mask)
-                r, c = ns.compute_norm_scales(W_comp, mask, 'col', device); mkf = mask.float
+                r, c = ns.compute_norm_scales(W_comp, mask, 'col', device); mkf = mask.float()
                 rc = r.view(-1, 1) * c.view(1, -1)
                 W_norm = W_comp / rc
                 q, s, z, _ = quantize_rtn(W_norm, mm, group_size=block)
-                s = (s * r.view(-1, 1, 1)) if s.dim == 3 else (s * r.view(-1, 1))
+                s = (s * r.view(-1, 1, 1)) if s.dim() == 3 else (s * r.view(-1, 1))
                 s = torch.nan_to_num(s, nan=1e-4, posinf=6e4, neginf=1e-4).clamp(min=1e-8, max=6e4)
                 D_rtn = eq.dequant_deployed(q, s, z, mkf, c) - W
                 D_dc = dcrm_quantize(W_norm, mkf, NBITS, block) * rc * mkf - W
@@ -114,7 +114,7 @@ def run_model(MODEL, device="cuda"):
                     tot[mk]["rtn"][hk] += out_err(D_rtn, H[hk])
                     tot[mk]["dcrm"][hk] += out_err(D_dc, H[hk])
             nmat += 1
-        layers[li] = layer.to("cpu"); torch.cuda.empty_cache
+        layers[li] = layer.to("cpu"); torch.cuda.empty_cache()
     print(f"  pooled {nmat} matrices/mask. CoV(n_j)=per-column count coeff-of-variation (low=uniform=balance).", flush=True)
     print(f"  dcrm GAIN = 1 - e/e_rtn (per-column DC removal; calib-free). balance-favoring if bal>>wan,mag.", flush=True)
     for mk in MK:
@@ -125,11 +125,11 @@ def run_model(MODEL, device="cuda"):
         print(row, flush=True)
 
 
-def main:
-    P = argparse.ArgumentParser; P.add_argument("--models", default="gemma-2b,tinyllama,qwen-1.5b")
-    Aa = P.parse_args
-    for m in Aa.models.split(","): run_model(m.strip)
+def main():
+    P = argparse.ArgumentParser(); P.add_argument("--models", default="gemma-2b,tinyllama,qwen-1.5b")
+    Aa = P.parse_args()
+    for m in Aa.models.split(","): run_model(m.strip())
 
 
 if __name__ == "__main__":
-    main
+    main()

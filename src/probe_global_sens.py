@@ -25,39 +25,39 @@ def run_model(MODEL):
     batch = bs.get_calibration_data(tok, n_samples=1, seq_len=256, dataset_key="wikitext2").to(DEV)
     torch.manual_seed(0)
     model = AutoModelForCausalLM.from_pretrained(name, torch_dtype=torch.bfloat16, device_map=DEV, low_cpu_mem_usage=True)
-    model.eval
+    model.eval()
     layers = bs.get_transformer_layers(model)
     caps = {}
     hooks = []
     def mk(i):
         def h(mod, inp, out):
             o = out[0] if isinstance(out, tuple) else out
-            o.retain_grad; caps[i] = o
+            o.retain_grad(); caps[i] = o
         return h
     for i, l in enumerate(layers):
         hooks.append(l.register_forward_hook(mk(i)))
     out = model(batch, labels=batch)
-    out.loss.backward
-    for h in hooks: h.remove
+    out.loss.backward()
+    for h in hooks: h.remove()
     sens = []
     for i in range(len(layers)):
         g = caps[i].grad
-        sens.append(float((g.float ** 2).mean.item) if g is not None else 0.0)
+        sens.append(float((g.float() ** 2).mean().item()) if g is not None else 0.0)
     s = torch.tensor(sens)
-    s = s / s.mean.clamp(min=1e-30)                       # normalize to mean 1
+    s = s / s.mean().clamp(min=1e-30)                       # normalize to mean 1
     print(f"\n######## {MODEL} L={len(layers)} loss={float(out.loss):.3f} ########", flush=True)
-    print(f"  per-layer GLOBAL sensitivity s_l (normalized mean=1): min={s.min:.3f} max={s.max:.3f} "
-          f"span={s.max/s.min.clamp(min=1e-6):.1f}x  std/mean={s.std:.2f}", flush=True)
-    prof = "  ".join(f"{v:.2f}" for v in s.tolist)
+    print(f"  per-layer GLOBAL sensitivity s_l (normalized mean=1): min={s.min():.3f} max={s.max():.3f} "
+          f"span={s.max()/s.min().clamp(min=1e-6):.1f}x  std/mean={s.std():.2f}", flush=True)
+    prof = "  ".join(f"{v:.2f}" for v in s.tolist())
     print(f"  profile: {prof}", flush=True)
-    del model; torch.cuda.empty_cache
+    del model; torch.cuda.empty_cache()
 
 
-def main:
-    P = argparse.ArgumentParser; P.add_argument("--models", default="gemma-2b,tinyllama,qwen-1.5b")
-    A = P.parse_args
-    for m in A.models.split(","): run_model(m.strip)
+def main():
+    P = argparse.ArgumentParser(); P.add_argument("--models", default="gemma-2b,tinyllama,qwen-1.5b")
+    A = P.parse_args()
+    for m in A.models.split(","): run_model(m.strip())
 
 
 if __name__ == "__main__":
-    main
+    main()

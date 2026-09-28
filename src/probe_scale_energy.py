@@ -69,7 +69,7 @@ def endpoint_rtn_clip(W_norm, mask, nbits, gsize, rho):
     coded range (clip extremes, finer bulk step); rho>1 expands it. Same 2 stored
     values/group (scale,zero) => bpw-identical. Returns W_hat_norm[K,N]."""
     K, N = W_norm.shape
-    m = mask.bool
+    m = mask.bool()
     n_levels = 2 ** nbits - 1
     grouped = N > gsize and N % gsize == 0
     if grouped:
@@ -100,7 +100,7 @@ def endpoint_rtn_gated_clip(W_norm, mask, nbits, gsize, colE, rho_lo, rho_hi):
     else clip gently (rho_hi). Deterministic global rule keyed on ||X||^2 (already
     collected for OBS). Same storage as RTN. Returns W_hat_norm[K,N]."""
     K, N = W_norm.shape
-    m = mask.bool
+    m = mask.bool()
     n_levels = 2 ** nbits - 1
     grouped = N > gsize and N % gsize == 0
     if grouped:
@@ -117,7 +117,7 @@ def endpoint_rtn_gated_clip(W_norm, mask, nbits, gsize, colE, rho_lo, rho_hi):
     w_min = torch.where(empty, torch.zeros_like(w_min), w_min)
     w_max = torch.where(empty, torch.zeros_like(w_max), w_max)
     mid0 = 0.5 * (w_min + w_max)
-    dev = torch.where(Mg, (Wg - mid0).abs, torch.full_like(Wg, -big))
+    dev = torch.where(Mg, (Wg - mid0).abs(), torch.full_like(Wg, -big))
     ext_idx = dev.argmax(-1, keepdim=True)
     ext_E = torch.gather(cg, -1, ext_idx)
     med_E = torch.where(Mg, cg, torch.full_like(cg, big)).median(-1, keepdim=True).values
@@ -132,23 +132,23 @@ def endpoint_rtn_gated_clip(W_norm, mask, nbits, gsize, colE, rho_lo, rho_hi):
 
 
 def kurt(x):
-    x = x.float; m = x.mean; s = x.std.clamp(min=1e-12)
-    return float(((x - m) / s).pow(4).mean)
+    x = x.float(); m = x.mean(); s = x.std().clamp(min=1e-12)
+    return float(((x - m) / s).pow(4).mean())
 
 
 def _q(x, qq):
     """quantile with subsample (torch.quantile caps at ~16M elems)."""
-    x = x.float.reshape(-1)
-    if x.numel > 8_000_000:
-        x = x[torch.randperm(x.numel)[:8_000_000]]
+    x = x.float().reshape(-1)
+    if x.numel() > 8_000_000:
+        x = x[torch.randperm(x.numel())[:8_000_000]]
     return float(x.quantile(qq))
 
 
 def _cap(x, n=300_000):
     """subsample a per-matrix contribution so pooled arrays stay bounded."""
     x = x.reshape(-1)
-    if x.numel > n:
-        x = x[torch.randperm(x.numel, device=x.device)[:n]]
+    if x.numel() > n:
+        x = x[torch.randperm(x.numel(), device=x.device)[:n]]
     return x
 
 
@@ -166,7 +166,7 @@ def run_model(MODEL, gsizes, device="cuda"):
     acts_all = bs.collect_activations(model, cal, device)
     for _l in ns.get_layers(model):
         _l.to("cpu")
-    torch.cuda.empty_cache
+    torch.cuda.empty_cache()
 
     layer_paths = bs.get_layer_paths(model)
     layers = ns.get_layers(model)
@@ -209,23 +209,23 @@ def run_model(MODEL, gsizes, device="cuda"):
                 acts = acts_all.get(key)
                 if acts is None:
                     continue
-                W = lin.weight.data.clone
+                W = lin.weight.data.clone()
                 W_comp, mask = ns.balanced_mask_and_obs(W, acts.to(device), SP, device, col_exp=BETA)
                 r, c = ns.compute_norm_scales(W_comp, mask, 'col', device)
                 W_norm = W_comp / (r.view(-1, 1) * c.view(1, -1))
-                Xa = acts.to(device).float
-                if Xa.dim == 3:
+                Xa = acts.to(device).float()
+                if Xa.dim() == 3:
                     Xa = Xa.reshape(-1, Xa.shape[-1])
                 Xa = Xa[:min(Xa.shape[0], CAP256)]
-                H = Xa.t @ Xa
-                Hdiag = H.diag.clamp(min=0)
+                H = Xa.t() @ Xa
+                Hdiag = H.diag().clamp(min=0)
                 colE = (Xa * Xa).sum(0).clamp(min=0)          # ||X_j||^2 [N]
                 K, N = W_norm.shape
-                m = mask.float
+                m = mask.float()
 
                 # deployed RTN (reference)
                 q, scales, zeros, _ = quantize_rtn(W_norm, [0, 2 ** NBITS - 1], group_size=gsize)
-                if scales.dim == 3:
+                if scales.dim() == 3:
                     scales = scales * r.view(-1, 1, 1)
                 else:
                     scales = scales * r.view(-1, 1)
@@ -242,24 +242,24 @@ def run_model(MODEL, gsizes, device="cuda"):
                     A_full = A.expand(K, N)
                 step = (A_full * c.view(1, -1)) / (2 ** NBITS - 1)     # decode step per position
                 s_ij = (step * step) * colE.view(1, -1)                # output-error sensitivity
-                mb = mask.bool
+                mb = mask.bool()
                 _idx = None
-                _at_m = t.reshape(K, N)[mb].abs
+                _at_m = t.reshape(K, N)[mb].abs()
                 _s_m = s_ij[mb]
-                if _at_m.numel > 300_000:
-                    _idx = torch.randperm(_at_m.numel, device=_at_m.device)[:300_000]
+                if _at_m.numel() > 300_000:
+                    _idx = torch.randperm(_at_m.numel(), device=_at_m.device)[:300_000]
                     _at_m = _at_m[_idx]; _s_m = _s_m[_idx]
-                pooled_abst.append(_at_m.detach.cpu)
-                pooled_s.append(_s_m.detach.cpu)
+                pooled_abst.append(_at_m.detach().cpu())
+                pooled_s.append(_s_m.detach().cpu())
 
                 # B: error share by |t| bin (diag-H attribution of deployed RTN)
                 D = (W_rtn - W_comp)
                 err_ij = (D * D) * Hdiag.view(1, -1)                   # diag output-error attribution
-                at = t.reshape(K, N)[mb].abs
+                at = t.reshape(K, N)[mb].abs()
                 ei = err_ij[mb]
-                bidx = (at * NB).clamp(0, NB - 1e-6).long.cpu
-                binshare_err.index_add_(0, bidx, ei.detach.cpu)
-                binshare_cnt.index_add_(0, bidx, torch.ones_like(ei.detach.cpu))
+                bidx = (at * NB).clamp(0, NB - 1e-6).long().cpu()
+                binshare_err.index_add_(0, bidx, ei.detach().cpu())
+                binshare_cnt.index_add_(0, bidx, torch.ones_like(ei.detach().cpu()))
 
                 # C: uniform clip sweep
                 for rho in RHOS:
@@ -286,14 +286,14 @@ def run_model(MODEL, gsizes, device="cuda"):
                 if grouped:
                     ng = N // gsize
                     Wg_n = W_norm.view(K, ng, gsize)
-                    Mg_n = mask.view(K, ng, gsize).bool
+                    Mg_n = mask.view(K, ng, gsize).bool()
                     wcg = wcol.view(1, ng, gsize)
                     best_e = None; best_W = None
                     for rho in [1.0, 0.975, 0.95, 0.925, 0.90, 0.875, 0.85]:
                         Whn = endpoint_rtn_clip(W_norm, mask, NBITS, gsize, rho).view(K, ng, gsize)
                         eg = ((Wg_n - Whn) ** 2 * wcg * Mg_n).sum(-1)         # [K,ng] weighted err
                         if best_e is None:
-                            best_e = eg; best_W = Whn.clone
+                            best_e = eg; best_W = Whn.clone()
                         else:
                             take = eg < best_e
                             best_e = torch.where(take, eg, best_e)
@@ -305,39 +305,39 @@ def run_model(MODEL, gsizes, device="cuda"):
                         wins_awclip += 1
 
                 # E: OBS inflation — max|survivor| of W_comp vs of raw W at same positions
-                Wr = W.float.to(device)
+                Wr = W.float().to(device)
                 if grouped:
                     Wc_g = (W_comp).view(K, N // gsize, gsize)
                     Wr_g = Wr.view(K, N // gsize, gsize)
-                    Mg2 = mask.view(K, N // gsize, gsize).bool
+                    Mg2 = mask.view(K, N // gsize, gsize).bool()
                     cg = colE.view(1, N // gsize, gsize).expand(K, N // gsize, gsize)
                     big = torch.finfo(torch.float32).max
-                    mc = torch.where(Mg2, Wc_g.abs, torch.zeros_like(Wc_g)).amax(-1)
-                    mr = torch.where(Mg2, Wr_g.abs, torch.zeros_like(Wr_g)).amax(-1)
+                    mc = torch.where(Mg2, Wc_g.abs(), torch.zeros_like(Wc_g)).amax(-1)
+                    mr = torch.where(Mg2, Wr_g.abs(), torch.zeros_like(Wr_g)).amax(-1)
                     ratio = (mc / mr.clamp(min=1e-8))
-                    infl_ratios.append(ratio[Mg2.any(-1)].detach.cpu)
+                    infl_ratios.append(ratio[Mg2.any(-1)].detach().cpu())
                     # is the compensated extreme in a low-energy column?
-                    dev = torch.where(Mg2, (Wc_g).abs, torch.full_like(Wc_g, -big))
+                    dev = torch.where(Mg2, (Wc_g).abs(), torch.full_like(Wc_g, -big))
                     ext_idx = dev.argmax(-1, keepdim=True)
                     ext_E = torch.gather(cg, -1, ext_idx).squeeze(-1)
                     med_E = torch.where(Mg2, cg, torch.full_like(cg, big)).median(-1).values
                     good = Mg2.any(-1)
-                    ext_lowE_frac.append((ext_E[good] < med_E[good]).float.detach.cpu)
+                    ext_lowE_frac.append((ext_E[good] < med_E[good]).float().detach().cpu())
                 nmat += 1
             layers[li] = layer.to("cpu")
-            torch.cuda.empty_cache
+            torch.cuda.empty_cache()
 
         # ---- report for this gsize
         AT = torch.cat(pooled_abst); S = torch.cat(pooled_s)
-        Sn = S / S.sum.clamp(min=1e-30)
+        Sn = S / S.sum().clamp(min=1e-30)
         # energy-weighted mean |t| vs unweighted
-        ew_meanabs = float((AT * Sn).sum)
-        print(f"\n-- gsize={gsize} pooled survivors n={AT.numel} nmat={nmat}", flush=True)
-        print(f"   |t| law: unweighted mean={float(AT.mean):.4f} p90={_q(AT,0.90):.4f}  "
+        ew_meanabs = float((AT * Sn).sum())
+        print(f"\n-- gsize={gsize} pooled survivors n={AT.numel()} nmat={nmat}", flush=True)
+        print(f"   |t| law: unweighted mean={float(AT.mean()):.4f} p90={_q(AT,0.90):.4f}  "
               f"ENERGY-weighted mean|t|={ew_meanabs:.4f}  (uniform |t| mean=0.5; "
               f">0.5 => energy at extremes)", flush=True)
-        es = binshare_err / binshare_err.sum.clamp(min=1e-30)
-        cs = binshare_cnt / binshare_cnt.sum.clamp(min=1e-30)
+        es = binshare_err / binshare_err.sum().clamp(min=1e-30)
+        cs = binshare_cnt / binshare_cnt.sum().clamp(min=1e-30)
         print(f"   error-share by |t| bin (0..1): err%={[round(float(x)*100,1) for x in es]}  "
               f"cnt%={[round(float(x)*100,1) for x in cs]}", flush=True)
         print(f"   [C] CLIP SWEEP pooled tr(DHD^T)/RTN, wins/{nmat}:", flush=True)
@@ -347,14 +347,14 @@ def run_model(MODEL, gsizes, device="cuda"):
         print(f"   [D2] AWCLIP (act-weighted per-group scale): ratio={e_awclip/e_rtn_tot:.4f} "
               f"wins={wins_awclip}/{nmat}   <-- the measured lever", flush=True)
         IR = torch.cat(infl_ratios); EL = torch.cat(ext_lowE_frac)
-        print(f"   [E] OBS inflation max|Wcomp|/max|Wraw| per group: median={float(IR.median):.3f} "
-              f"p90={_q(IR,0.90):.3f} frac>1.05={float((IR>1.05).float.mean):.3f} | "
-              f"compensated-extreme-in-lowE-col frac={float(EL.mean):.3f}", flush=True)
+        print(f"   [E] OBS inflation max|Wcomp|/max|Wraw| per group: median={float(IR.median()):.3f} "
+              f"p90={_q(IR,0.90):.3f} frac>1.05={float((IR>1.05).float().mean()):.3f} | "
+              f"compensated-extreme-in-lowE-col frac={float(EL.mean()):.3f}", flush=True)
 
 
 def _hull_t(W_norm, mask, gsize):
     K, N = W_norm.shape
-    m = mask.bool
+    m = mask.bool()
     grouped = N > gsize and N % gsize == 0
     if grouped:
         Wg = W_norm.view(K, N // gsize, gsize); Mg = m.view(K, N // gsize, gsize)
@@ -372,15 +372,15 @@ def _hull_t(W_norm, mask, gsize):
     return t, mu, A, Mg, grouped
 
 
-def main:
-    P = argparse.ArgumentParser
+def main():
+    P = argparse.ArgumentParser()
     P.add_argument("--models", default="gemma-2b,tinyllama,qwen-1.5b")
     P.add_argument("--gsizes", default="64,128")
-    A = P.parse_args
+    A = P.parse_args()
     gsizes = [int(x) for x in A.gsizes.split(",")]
     for mdl in A.models.split(","):
-        run_model(mdl.strip, gsizes)
+        run_model(mdl.strip(), gsizes)
 
 
 if __name__ == "__main__":
-    main
+    main()

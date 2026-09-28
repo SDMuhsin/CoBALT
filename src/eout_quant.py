@@ -43,12 +43,12 @@ def _group_view(t, gsize):
 def budget_width(mask, nbits, gsize):
     """b' = min(floor(B_codes / k), CAP) from the bitmap alone (math4)."""
     K, N = mask.shape
-    k = int(mask.sum.item)
+    k = int(mask.sum().item())
     if k == 0:
         return nbits, 0
     if N % gsize != 0:
         return nbits, k  # non-divisible shape: fall back to deployed width
-    g_ne = int((_group_view(mask, gsize).sum(-1) > 0).sum.item)
+    g_ne = int((_group_view(mask, gsize).sum(-1) > 0).sum().item())
     b_codes = nbits * K * N + 32 * (K * N // gsize - g_ne)
     return max(nbits, min(b_codes // k, WIDTH_CAP)), k
 
@@ -56,16 +56,16 @@ def budget_width(mask, nbits, gsize):
 def dequant_deployed(q, scales, zeros, mask, c):
     """Deployed decode: ((q - z) * s) * c, then post-mask. Mirrors
     dequantize_sparse_sinq (r is already folded into scales)."""
-    Q = q.float
-    z = zeros.float
-    s = scales.float
-    if s.dim == 3:
+    Q = q.float()
+    z = zeros.float()
+    s = scales.float()
+    if s.dim() == 3:
         K, N = Q.shape
         gsize = N // s.shape[1]
         W = ((_group_view(Q, gsize) - z) * s).reshape(K, N)
     else:
         W = (Q - z) * s
-    return W * c.view(1, -1) * mask.float
+    return W * c.view(1, -1) * mask.float()
 
 
 def repack_quantize(W_norm, mask, bprime, gsize):
@@ -73,11 +73,11 @@ def repack_quantize(W_norm, mask, bprime, gsize):
     Returns (q, scales[K,n_g,1], zeros[K,n_g,1]) in the deployed format
     (deployed clamp min 1e-4 on the range kept for parity)."""
     K, N = W_norm.shape
-    m = mask.bool
+    m = mask.bool()
     n_levels = 2 ** bprime - 1
     if N > gsize and N % gsize == 0:
         Wg = _group_view(W_norm, gsize)
-        Mg = _group_view(m.float, gsize).bool
+        Mg = _group_view(m.float(), gsize).bool()
         big = torch.finfo(torch.float32).max
         w_min = torch.where(Mg, Wg, torch.full_like(Wg, big)).amin(-1, keepdim=True)
         w_max = torch.where(Mg, Wg, torch.full_like(Wg, -big)).amax(-1, keepdim=True)
@@ -103,8 +103,8 @@ def repack_quantize(W_norm, mask, bprime, gsize):
 
 def eout_sq(W_hat, W_target, H):
     """||X (W_hat - W')^T||_F^2 = tr(D H D^T), fp64 for the verdict."""
-    D = (W_hat - W_target).double
-    return float((D @ H.double * D).sum.item)
+    D = (W_hat - W_target).double()
+    return float((D @ H.double() * D).sum().item())
 
 
 # fp16-representable clamp for stored per-group (center, half-range) metadata.
@@ -123,7 +123,7 @@ def sign_magnitude_deadzone_quantize(W_norm, mask, nbits, gsize):
     (uniform magnitude levels), NOT repack/multiprecision. Non-iterative, global rule.
     Returns W_hat_norm [K,N]."""
     K, N = W_norm.shape
-    m = mask.bool
+    m = mask.bool()
     L = 2 ** nbits
     half = L // 2                                    # magnitude levels per sign
     grouped = N > gsize and N % gsize == 0
@@ -131,7 +131,7 @@ def sign_magnitude_deadzone_quantize(W_norm, mask, nbits, gsize):
         Wg = W_norm.view(K, N // gsize, gsize); Mg = m.view(K, N // gsize, gsize)
     else:
         Wg = W_norm.unsqueeze(1); Mg = m.unsqueeze(1)
-    A = Wg.abs
+    A = Wg.abs()
     big = torch.finfo(torch.float32).max
     m_hi = torch.where(Mg, A, torch.zeros_like(A)).amax(-1, keepdim=True).clamp(min=1e-8)
     m_lo = torch.where(Mg, A, torch.full_like(A, big)).amin(-1, keepdim=True)
@@ -162,15 +162,15 @@ def _compand_grouped(Wg, Mg, gamma, n_levels):
     cnt = Mg.sum(-1, keepdim=True).clamp(min=1.0)
     mu = torch.where(Mg, Wg, torch.zeros_like(Wg)).sum(-1, keepdim=True) / cnt   # survivor mean
     t0 = Wg - mu
-    A = torch.where(Mg, t0.abs, torch.zeros_like(t0)).amax(-1, keepdim=True).clamp(min=1e-8)
+    A = torch.where(Mg, t0.abs(), torch.zeros_like(t0)).amax(-1, keepdim=True).clamp(min=1e-8)
     empty = ~Mg.any(-1, keepdim=True)
     mu = torch.where(empty, torch.zeros_like(mu), mu)
     A = torch.where(empty, torch.ones_like(A), A)
     t = ((Wg - mu) / A).clamp(-1.0, 1.0)
-    v = torch.sign(t) * t.abs.pow(gamma)
+    v = torch.sign(t) * t.abs().pow(gamma)
     q = torch.round((v + 1.0) * 0.5 * n_levels).clamp(0, n_levels)
     v_hat = 2.0 * q / n_levels - 1.0
-    t_hat = torch.sign(v_hat) * v_hat.abs.pow(1.0 / gamma)
+    t_hat = torch.sign(v_hat) * v_hat.abs().pow(1.0 / gamma)
     return mu + A * t_hat
 
 
@@ -181,17 +181,17 @@ def compand_quantize(W_norm, mask, nbits, gsize):
     A shape prior with 1 DOF/tensor — NOT the per-weight E_out descent (blacklist
     A4). Evaluated held-out downstream, not on this MSE."""
     K, N = W_norm.shape
-    m = mask.bool
+    m = mask.bool()
     n_levels = 2 ** nbits - 1
     grouped = N > gsize and N % gsize == 0
     if grouped:
-        Wg, Mg = _group_view(W_norm, gsize), _group_view(m.float, gsize).bool
+        Wg, Mg = _group_view(W_norm, gsize), _group_view(m.float(), gsize).bool()
     else:
         Wg, Mg = W_norm.unsqueeze(1), m.unsqueeze(1)               # [K,1,N]
     best_g, best_e, best_W = 1.0, None, None
     for g in GAMMA_GRID:
         W_hat = _compand_grouped(Wg, Mg, g, n_levels)
-        err = float(((W_hat - Wg) * Mg)[Mg].pow(2).sum.item)   # plain survivor MSE
+        err = float(((W_hat - Wg) * Mg)[Mg].pow(2).sum().item())   # plain survivor MSE
         if best_e is None or err < best_e:
             best_g, best_e, best_W = g, err, W_hat
     return best_W.reshape(K, N), best_g
@@ -215,7 +215,7 @@ def bincenter_gated_quantize(W_norm, mask, nbits, gsize, colnorm, alpha=None):
     Returns W_hat_norm [K,N]."""
     alpha = BINC_ALPHA if alpha is None else float(alpha)
     K, N = W_norm.shape
-    m = mask.bool
+    m = mask.bool()
     L = 2 ** nbits
     grouped = N > gsize and N % gsize == 0
     if grouped:
@@ -234,7 +234,7 @@ def bincenter_gated_quantize(W_norm, mask, nbits, gsize, colnorm, alpha=None):
     w_max = torch.where(empty, torch.zeros_like(w_max), w_max)
     # locate the extreme (max |w-mid|) survivor's column activation vs group median activation
     mid0 = 0.5 * (w_min + w_max)
-    dev = torch.where(Mg, (Wg - mid0).abs, torch.full_like(Wg, -big))
+    dev = torch.where(Mg, (Wg - mid0).abs(), torch.full_like(Wg, -big))
     ext_idx = dev.argmax(-1, keepdim=True)                       # [K,ng,1]
     ext_colnorm = torch.gather(cg, -1, ext_idx)                  # activation of the extreme's column
     med_colnorm = torch.where(Mg, cg, torch.full_like(cg, big)).median(-1, keepdim=True).values
@@ -264,7 +264,7 @@ def bincenter_quantize(W_norm, mask, nbits, gsize, alpha=None):
     Non-iterative, single GLOBAL alpha (no per-layer fit). Returns W_hat_norm[K,N]."""
     alpha = BINC_ALPHA if alpha is None else float(alpha)
     K, N = W_norm.shape
-    m = mask.bool
+    m = mask.bool()
     L = 2 ** nbits
     grouped = N > gsize and N % gsize == 0
     if grouped:
@@ -329,7 +329,7 @@ def awclip_quantize(W_norm, mask, nbits, gsize, wcol):
     matters, and keeps rho=1 for the minority of groups whose extreme DOES carry energy.
     Returns W_hat_norm [K,N]."""
     K, N = W_norm.shape
-    m = mask.bool
+    m = mask.bool()
     n_levels = 2 ** nbits - 1
     grouped = N > gsize and N % gsize == 0
     if grouped:
@@ -369,7 +369,7 @@ def awclipz_quantize(W_norm, mask, nbits, gsize, wcol):
     values/group (scale, zero) as RTN => bpw-identical. Non-iterative, global rule.
     Strictly >= awclip (awclip = the delta=0 slice). Returns W_hat_norm [K,N]."""
     K, N = W_norm.shape
-    m = mask.bool
+    m = mask.bool()
     n_levels = 2 ** nbits - 1
     grouped = N > gsize and N % gsize == 0
     if grouped:
@@ -405,7 +405,7 @@ def awclipz_quantize(W_norm, mask, nbits, gsize, wcol):
 def _step_matrix(scales, r, c, K, N, gsize):
     """Per-position decode step a_ij = s_g(i,j) * r_i * c_j (change in W_hat
     per unit code)."""
-    if scales.dim == 3:
+    if scales.dim() == 3:
         s_full = scales.expand(K, N // gsize, gsize).reshape(K, N)
     else:
         s_full = scales.expand(K, N)
@@ -422,20 +422,20 @@ def code_descent(q, scales, zeros, mask, r, c, W_target, H, bprime, gsize,
     may use the full b' range: step-replication extends deployed grids).
     Returns new q (float tensor of ints)."""
     K, N = W_target.shape
-    m = mask.bool
+    m = mask.bool()
     n_levels = 2 ** bprime - 1
     a = _step_matrix(scales, r, c, K, N, gsize)          # [K,N]
-    q = q.float.clone
+    q = q.float().clone()
     W_hat = dequant_deployed(q, scales, zeros, mask, c)
-    D = (W_hat - W_target).float                        # [K,N]
-    Hf = H.float
+    D = (W_hat - W_target).float()                        # [K,N]
+    Hf = H.float()
     U = D @ Hf                                            # [K,N] residual grad
-    hdiag = Hf.diag                                     # [N]
+    hdiag = Hf.diag()                                     # [N]
     for _ in range(passes):
         improved = False
         for j in range(N):
             mj = m[:, j]
-            if not mj.any:
+            if not mj.any():
                 continue
             aj = a[:, j]
             hjj = hdiag[j]
@@ -447,7 +447,7 @@ def code_descent(q, scales, zeros, mask, r, c, W_target, H, bprime, gsize,
             dq = q_new - q[:, j]
             dE = 2.0 * aj * dq * U[:, j] + denom * dq * dq
             take = mj & (dE < 0) & (dq != 0)
-            if not take.any:
+            if not take.any():
                 continue
             improved = True
             dw = torch.where(take, aj * dq, torch.zeros_like(aj))    # [K]
@@ -469,9 +469,9 @@ def eout_requantize(W_comp, mask, X, nbits, gsize, r, c,
     into scales_dep already, as nosink does).
     """
     K, N = W_comp.shape
-    Wt = W_comp.float
-    mk = mask.float
-    H = (X.float.t @ X.float)                       # [N,N]
+    Wt = W_comp.float()
+    mk = mask.float()
+    H = (X.float().t() @ X.float())                       # [N,N]
 
     W_rtn = dequant_deployed(q_dep, scales_dep, zeros_dep, mk, c)
     e_rtn = eout_sq(W_rtn, Wt, H)
@@ -486,7 +486,7 @@ def eout_requantize(W_comp, mask, X, nbits, gsize, r, c,
         # ACTIVATION-GATED binc: per-group endpoint-vs-bincenter by the extreme survivor's
         # column activation. Deterministic global rule, no fit/iteration. bpw == RTN.
         W_norm = Wt / (r.view(-1, 1) * c.view(1, -1))
-        colnorm = (X.float * X.float).sum(0).clamp(min=0)      # [N] ||X_j||^2
+        colnorm = (X.float() * X.float()).sum(0).clamp(min=0)      # [N] ||X_j||^2
         W_hat_n = bincenter_gated_quantize(W_norm, mk, nbits, gsize, colnorm)
         W_bg = W_hat_n * (r.view(-1, 1) * c.view(1, -1)) * mk
         e_bg = eout_sq(W_bg, Wt, H)
@@ -512,8 +512,8 @@ def eout_requantize(W_comp, mask, X, nbits, gsize, r, c,
         # minimize the OUTPUT-error diagonal instead of max-abs. Targets tr(DHD^T), not the
         # (near-uniform) marginal value law — the axis every prior arm left at RTN's max-abs.
         W_norm = Wt / (r.view(-1, 1) * c.view(1, -1))
-        colE = (X.float * X.float).sum(0).clamp(min=0)          # [N] ||X_j||^2
-        wcol = (c.float ** 2) * colE                              # diag output weight (norm space)
+        colE = (X.float() * X.float()).sum(0).clamp(min=0)          # [N] ||X_j||^2
+        wcol = (c.float() ** 2) * colE                              # diag output weight (norm space)
         W_hat_n = awclip_quantize(W_norm, mk, nbits, gsize, wcol)
         W_ac = W_hat_n * (r.view(-1, 1) * c.view(1, -1)) * mk
         e_ac = eout_sq(W_ac, Wt, H)
@@ -522,8 +522,8 @@ def eout_requantize(W_comp, mask, X, nbits, gsize, r, c,
 
     if arm == "awclipz":
         W_norm = Wt / (r.view(-1, 1) * c.view(1, -1))
-        colE = (X.float * X.float).sum(0).clamp(min=0)
-        wcol = (c.float ** 2) * colE
+        colE = (X.float() * X.float()).sum(0).clamp(min=0)
+        wcol = (c.float() ** 2) * colE
         W_hat_n = awclipz_quantize(W_norm, mk, nbits, gsize, wcol)
         W_az = W_hat_n * (r.view(-1, 1) * c.view(1, -1)) * mk
         e_az = eout_sq(W_az, Wt, H)
@@ -547,7 +547,7 @@ def eout_requantize(W_comp, mask, X, nbits, gsize, r, c,
     # r into scales exactly as nosink does, so decode semantics are identical.
     W_norm = Wt / (r.view(-1, 1) * c.view(1, -1))
     q_rp, s_rp, z_rp = repack_quantize(W_norm, mk, bprime, gsize)
-    if s_rp.dim == 3:
+    if s_rp.dim() == 3:
         s_rp = s_rp * r.view(-1, 1, 1)
     else:
         s_rp = s_rp * r.view(-1, 1)
@@ -564,9 +564,9 @@ def eout_requantize(W_comp, mask, X, nbits, gsize, r, c,
     cands = [("rtn", W_rtn, e_rtn), ("repack", W_rp, e_rp)]
     # descent from D° (deployed grids, code range extended to b' by step
     # replication — exactly math4's D° lever) and from repack grids.
-    q_d1 = code_descent(q_dep.float, scales_dep.float, zeros_dep.float,
+    q_d1 = code_descent(q_dep.float(), scales_dep.float(), zeros_dep.float(),
                         mk, r, c, Wt, H, bprime, gsize, passes=passes)
-    W_d1 = dequant_deployed(q_d1, scales_dep.float, zeros_dep.float, mk, c)
+    W_d1 = dequant_deployed(q_d1, scales_dep.float(), zeros_dep.float(), mk, c)
     cands.append(("descend-rtn", W_d1, eout_sq(W_d1, Wt, H)))
     q_d2 = code_descent(q_rp, s_rp, z_rp, mk, r, c, Wt, H, bprime, gsize,
                         passes=passes)
@@ -595,15 +595,15 @@ def repack_only(W_target, mask, nbits, gsize, r, c):
       wanda-sinq : r=mu2,   c=mu1,         W_target=W_pruned  (Sinkhorn dual)
     """
     K, N = W_target.shape
-    Wt = W_target.float
-    mk = mask.float
+    Wt = W_target.float()
+    mk = mask.float()
     bprime, k = budget_width(mk, nbits, gsize)
     info = {"bprime": int(bprime), "k": int(k)}
     if k == 0 or (N % gsize != 0 and N > gsize):
         return Wt * mk, {**info, "picked": "empty"}
     W_norm = Wt / (r.view(-1, 1) * c.view(1, -1))
     q, s, z = repack_quantize(W_norm, mk, bprime, gsize)
-    if s.dim == 3:
+    if s.dim() == 3:
         s = s * r.view(-1, 1, 1)
     else:
         s = s * r.view(-1, 1)
@@ -622,9 +622,9 @@ def bincenter_only(W_target, mask, nbits, gsize, r, c, alpha=None):
       wanda-sinq : r=mu2,      c=mu1,         W_target=W_pruned
     Same storage as RTN (2 vals/group), uniform b bits ⇒ bpw-identical. Returns W_dense[K,N]."""
     K, N = W_target.shape
-    Wt = W_target.float
-    mk = mask.float
-    k = int(mk.sum.item)
+    Wt = W_target.float()
+    mk = mask.float()
+    k = int(mk.sum().item())
     if k == 0 or (N % gsize != 0 and N > gsize):
         return Wt * mk
     W_norm = Wt / (r.view(-1, 1) * c.view(1, -1))
@@ -643,13 +643,13 @@ def awclip_only(W_target, mask, nbits, gsize, r, c, colE, alpha=None):
       wanda-sinq : r=mu2,      c=mu1,          W_target=W_pruned
     Same storage as RTN (2 vals/group), uniform b bits => bpw-identical. Returns W_dense[K,N]."""
     K, N = W_target.shape
-    Wt = W_target.float
-    mk = mask.float
-    k = int(mk.sum.item)
+    Wt = W_target.float()
+    mk = mask.float()
+    k = int(mk.sum().item())
     if k == 0 or (N % gsize != 0 and N > gsize):
         return Wt * mk
     W_norm = Wt / (r.view(-1, 1) * c.view(1, -1))
-    wcol = (c.float ** 2) * colE.float                     # diag output weight in norm space
+    wcol = (c.float() ** 2) * colE.float()                     # diag output weight in norm space
     W_hat_n = awclip_quantize(W_norm, mk, nbits, gsize, wcol)
     return W_hat_n * (r.view(-1, 1) * c.view(1, -1)) * mk
 
@@ -659,12 +659,12 @@ def awclipz_only(W_target, mask, nbits, gsize, r, c, colE):
     normalized space W_target/(r (x) c). Mirrors awclip_only so baselines get the SAME
     lever (fairness). Same storage as RTN => bpw-identical. Returns W_dense[K,N]."""
     K, N = W_target.shape
-    Wt = W_target.float; mk = mask.float
-    k = int(mk.sum.item)
+    Wt = W_target.float(); mk = mask.float()
+    k = int(mk.sum().item())
     if k == 0 or (N % gsize != 0 and N > gsize):
         return Wt * mk
     W_norm = Wt / (r.view(-1, 1) * c.view(1, -1))
-    wcol = (c.float ** 2) * colE.float
+    wcol = (c.float() ** 2) * colE.float()
     W_hat_n = awclipz_quantize(W_norm, mk, nbits, gsize, wcol)
     return W_hat_n * (r.view(-1, 1) * c.view(1, -1)) * mk
 
@@ -680,7 +680,7 @@ def log_margin(path, row):
     with open(path, "a", newline="") as f:
         fcntl.flock(f, fcntl.LOCK_EX)
         w = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
-        if f.tell == 0:
-            w.writeheader
+        if f.tell() == 0:
+            w.writeheader()
         w.writerow(row)
         fcntl.flock(f, fcntl.LOCK_UN)

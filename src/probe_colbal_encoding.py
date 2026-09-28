@@ -48,8 +48,8 @@ AWZ_DELTAS = (-0.10, -0.05, 0.0, 0.05, 0.10)   # zero-point shift as fraction of
 
 
 def out_err(W_hat, W_dense, H):
-    D = (W_hat - W_dense).double
-    return float((D @ H.double * D).sum.item)
+    D = (W_hat - W_dense).double()
+    return float((D @ H.double() * D).sum().item())
 
 
 def awclipz_quantize(W_norm, mask, nbits, gsize, wcol):
@@ -57,7 +57,7 @@ def awclipz_quantize(W_norm, mask, nbits, gsize, wcol):
     scale) x delta (center shift) on a fixed global grid, pick per-group argmin of
     sum_j wcol_j (W_norm - W_hat)^2. Same 2 stored vals/group as RTN. Non-iterative."""
     K, N = W_norm.shape
-    m = mask.bool
+    m = mask.bool()
     n_levels = 2 ** nbits - 1
     grouped = N > gsize and N % gsize == 0
     if grouped:
@@ -104,7 +104,7 @@ def run_model(MODEL, device="cuda"):
     acts_all = bs.collect_activations(model, cal, device)
     for _l in ns.get_layers(model):
         _l.to("cpu")
-    torch.cuda.empty_cache
+    torch.cuda.empty_cache()
     layer_paths = bs.get_layer_paths(model)
     layers = ns.get_layers(model)
     n_layers = len(layers)
@@ -131,17 +131,17 @@ def run_model(MODEL, device="cuda"):
             acts = acts_all.get(f'layer_{li}.{ap}')
             if acts is None:
                 continue
-            W = lin.weight.data.clone.float.to(device)
+            W = lin.weight.data.clone().float().to(device)
             K, N = W.shape
             block = bs._largest_divisor_leq(N, GROUP)
-            Xa = acts.to(device).float
-            if Xa.dim == 3:
+            Xa = acts.to(device).float()
+            if Xa.dim() == 3:
                 Xa = Xa.reshape(-1, Xa.shape[-1])
             Xa = Xa[:min(Xa.shape[0], CAP256)]
-            H = Xa.t @ Xa
+            H = Xa.t() @ Xa
             colE = (Xa * Xa).sum(0).clamp(min=0)
             Hinv = compute_hessian_inverse(Xa, damping=None)
-            hdiag_inv = Hinv.diag.clamp(min=1e-8)                 # [N] [H^-1]_jj (compensability)
+            hdiag_inv = Hinv.diag().clamp(min=1e-8)                 # [N] [H^-1]_jj (compensability)
 
             for mkname in ["balanced", "wanda"]:
                 if mkname == "balanced":
@@ -149,11 +149,11 @@ def run_model(MODEL, device="cuda"):
                 else:
                     W_comp, mask = ns.wanda_mask_and_obs(W, acts.to(device), SP, device, scope='per_row')
                 r, c = ns.compute_norm_scales(W_comp, mask, 'col', device)
-                mkf = mask.float
+                mkf = mask.float()
                 # rtn
                 W_norm = W_comp / (r.view(-1, 1) * c.view(1, -1))
                 q, s, z, _ = quantize_rtn(W_norm, min_max, group_size=block)
-                if s.dim == 3:
+                if s.dim() == 3:
                     s = s * r.view(-1, 1, 1)
                 else:
                     s = s * r.view(-1, 1)
@@ -164,7 +164,7 @@ def run_model(MODEL, device="cuda"):
                 W_ac = eq.awclip_only(W_comp, mask, NBITS, block, r, c, colE)
                 tot[mkname]["awclip"] += out_err(W_ac, W, H)
                 # awclipz (joint scale+zero)
-                wcol = (c.float ** 2) * colE.float
+                wcol = (c.float() ** 2) * colE.float()
                 W_az = awclipz_quantize(W_norm, mkf, NBITS, block, wcol) * (r.view(-1, 1) * c.view(1, -1)) * mkf
                 tot[mkname]["awclipz"] += out_err(W_az, W, H)
                 # hdiagw: fold compensability into per-column scale (finer grid on hard-to-
@@ -172,7 +172,7 @@ def run_model(MODEL, device="cuda"):
                 c2 = (c * hdiag_inv.pow(0.25)).clamp(min=1e-8)
                 Wn2 = W_comp / (r.view(-1, 1) * c2.view(1, -1))
                 q2, s2, z2, _ = quantize_rtn(Wn2, min_max, group_size=block)
-                if s2.dim == 3:
+                if s2.dim() == 3:
                     s2 = s2 * r.view(-1, 1, 1)
                 else:
                     s2 = s2 * r.view(-1, 1)
@@ -181,7 +181,7 @@ def run_model(MODEL, device="cuda"):
                 tot[mkname]["hdiagw"] += out_err(W_hd, W, H)
             nmat += 1
         layers[li] = layer.to("cpu")
-        torch.cuda.empty_cache
+        torch.cuda.empty_cache()
 
     print(f"  encoding GAIN (1 - e/e_rtn), per mask, pooled over {nmat} matrices:", flush=True)
     for e in ["awclip", "awclipz", "hdiagw"]:
@@ -195,13 +195,13 @@ def run_model(MODEL, device="cuda"):
         print(f"    {e:<8} {tot['balanced'][e]/tot['wanda'][e]:.4f}", flush=True)
 
 
-def main:
-    P = argparse.ArgumentParser
+def main():
+    P = argparse.ArgumentParser()
     P.add_argument("--models", default="gemma-2b,tinyllama,qwen-1.5b")
-    A = P.parse_args
+    A = P.parse_args()
     for m in A.models.split(","):
-        run_model(m.strip)
+        run_model(m.strip())
 
 
 if __name__ == "__main__":
-    main
+    main()

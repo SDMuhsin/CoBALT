@@ -26,7 +26,7 @@ def group_kurt(W_norm, mask, gsize):
     K, N = W_norm.shape
     if not (N > gsize and N % gsize == 0):
         return None
-    Wg = W_norm.view(K, N // gsize, gsize); Mg = mask.view(K, N // gsize, gsize).bool
+    Wg = W_norm.view(K, N // gsize, gsize); Mg = mask.view(K, N // gsize, gsize).bool()
     cnt = Mg.sum(-1, keepdim=True).clamp(min=1.0)
     mu = torch.where(Mg, Wg, torch.zeros_like(Wg)).sum(-1, keepdim=True) / cnt
     Wc = torch.where(Mg, Wg - mu, torch.zeros_like(Wg))
@@ -35,7 +35,7 @@ def group_kurt(W_norm, mask, gsize):
     kurt = (m4 / var.clamp(min=1e-12) ** 2)
     valid = Mg.any(-1).squeeze(-1) if False else (cnt.squeeze(-1) > 3)
     k = kurt.squeeze(-1)[valid]
-    return float(k.mean.item) if k.numel else None
+    return float(k.mean().item()) if k.numel() else None
 
 
 def run_model(MODEL, device="cuda"):
@@ -47,7 +47,7 @@ def run_model(MODEL, device="cuda"):
     bs.move_embed_to_device(model, device)
     A = collect(model, tok, device, "wikitext2", 16)
     for _l in ns.get_layers(model): _l.to("cpu")
-    torch.cuda.empty_cache
+    torch.cuda.empty_cache()
     lp = bs.get_layer_paths(model); layers = ns.get_layers(model); nl = len(layers)
     sample = sorted(set([1, nl // 2, nl - 2]))
     print(f"\n######## {MODEL} sample={sample} g={GROUP} beta={BETA} ########", flush=True)
@@ -64,7 +64,7 @@ def run_model(MODEL, device="cuda"):
             if not isinstance(lin, torch.nn.Linear): continue
             key = f'layer_{li}.{ap}'
             if A.get(key) is None: continue
-            W = lin.weight.data.clone.float.to(device); K, N = W.shape
+            W = lin.weight.data.clone().float().to(device); K, N = W.shape
             block = bs._largest_divisor_leq(N, GROUP)
             X = A[key].to(device)
             for sp in SPS:
@@ -75,7 +75,7 @@ def run_model(MODEL, device="cuda"):
                 cv = mean_abs_adjcorr(W_norm, mask, block)
                 if kv is not None: kacc[sp][0] += kv; kacc[sp][1] += 1
                 if cv is not None: cacc[sp][0] += cv; cacc[sp][1] += 1
-        layers[li] = layer.to("cpu"); torch.cuda.empty_cache
+        layers[li] = layer.to("cpu"); torch.cuda.empty_cache()
     print(f"  survivor per-group KURTOSIS (uniform=1.8, gauss=3.0) and mean|adj corr| (indep~0) vs sparsity:", flush=True)
     print(f"    {'sp':<6}{'kurtosis':<12}{'|adj corr|':<12}", flush=True)
     for sp in SPS:
@@ -83,11 +83,11 @@ def run_model(MODEL, device="cuda"):
         print(f"    {sp:<6}{k:<12.3f}{cc:<12.4f}", flush=True)
 
 
-def main:
-    P = argparse.ArgumentParser; P.add_argument("--models", default="gemma-2b,tinyllama,qwen-1.5b")
-    Aa = P.parse_args
-    for m in Aa.models.split(","): run_model(m.strip)
+def main():
+    P = argparse.ArgumentParser(); P.add_argument("--models", default="gemma-2b,tinyllama,qwen-1.5b")
+    Aa = P.parse_args()
+    for m in Aa.models.split(","): run_model(m.strip())
 
 
 if __name__ == "__main__":
-    main
+    main()

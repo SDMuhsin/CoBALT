@@ -32,7 +32,7 @@ def exact_doubly_balanced(imp, sp):
     keep = torch.zeros(K * N, dtype=torch.bool, device=dev)
     # PASS 1: greedy with both caps (vectorization-hard due to sequential caps -> chunked python loop
     # over the sorted order, but only until all rows are full). Move to cpu ints for speed.
-    ro = rows.to('cpu').numpy; co = cols.to('cpu').numpy; od = order.to('cpu').numpy
+    ro = rows.to('cpu').numpy(); co = cols.to('cpu').numpy(); od = order.to('cpu').numpy()
     rc = [0] * K; cc = [0] * N
     keepl = bytearray(K * N)
     filled_rows = 0
@@ -52,12 +52,12 @@ def exact_doubly_balanced(imp, sp):
     return keep
 
 
-def main:
-    ap = argparse.ArgumentParser
+def main():
+    ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True)
     ap.add_argument("--sparsity", type=float, default=0.6)
     ap.add_argument("--n-mats", type=int, default=8)
-    args = ap.parse_args
+    args = ap.parse_args()
     name = bs.MODELS[args.model]
     tok = AutoTokenizer.from_pretrained(name)
     if tok.pad_token is None:
@@ -85,21 +85,21 @@ def main:
     sp = args.sparsity
     jacc = []; colcv_b = []; colcv_e = []
     for (li, ap_, mod, X) in sample:
-        W = mod.weight.data.clone.float.to(DEV)
+        W = mod.weight.data.clone().float().to(DEV)
         Xd = X.to(DEV)
-        if Xd.dim == 3:
+        if Xd.dim() == 3:
             Xd = Xd.reshape(-1, Xd.shape[-1])
         Xd = Xd[:min(Xd.shape[0], 256)]
         _, mb = ns.balanced_mask_and_obs(W, Xd, sp, DEV, col_exp=0.5, no_obs=True)
-        imp = W.abs * torch.norm(Xd, dim=0).view(1, -1)
+        imp = W.abs() * torch.norm(Xd, dim=0).view(1, -1)
         me = exact_doubly_balanced(imp, sp)
-        inter = (mb.bool & me.bool).sum.item
-        union = (mb.bool | me.bool).sum.item
+        inter = (mb.bool() & me.bool()).sum().item()
+        union = (mb.bool() | me.bool()).sum().item()
         jacc.append(inter / max(union, 1))
         # column keep-rate CV (lower = more balanced)
         cb = mb.sum(0); ce = me.sum(0)
-        colcv_b.append((cb.std / (cb.mean + 1e-9)).item)
-        colcv_e.append((ce.std / (ce.mean + 1e-9)).item)
+        colcv_b.append((cb.std() / (cb.mean() + 1e-9)).item())
+        colcv_e.append((ce.std() / (ce.mean() + 1e-9)).item())
     import statistics as st
     print(f"# model={args.model} sp={sp} n={len(sample)}")
     print(f"Jaccard(balanced, exact_doubly) = {st.mean(jacc):.4f}  (min {min(jacc):.4f} max {max(jacc):.4f})")
@@ -108,4 +108,4 @@ def main:
 
 
 if __name__ == "__main__":
-    main
+    main()

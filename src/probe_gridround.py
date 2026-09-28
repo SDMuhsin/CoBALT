@@ -46,7 +46,7 @@ def round_dist(W_norm, mask, gsize, nbits):
     """Fractional round distance rd[K,N] to the nearest group-RTN level (grid from mask hull).
     rd in [0,0.5]; weights outside the group hull -> 0.5 (promoting them would move the grid)."""
     K, N = W_norm.shape
-    m = mask.bool
+    m = mask.bool()
     grouped = N > gsize and N % gsize == 0
     if grouped:
         Wg = W_norm.view(K, N // gsize, gsize); Mg = m.view(K, N // gsize, gsize)
@@ -61,7 +61,7 @@ def round_dist(W_norm, mask, gsize, nbits):
     step = ((w_max - w_min).clamp(min=1e-8)) / (2 ** nbits - 1)
     q = torch.round((Wg - w_min) / step)
     level = w_min + q.clamp(0, 2 ** nbits - 1) * step
-    rd = ((Wg - level).abs / step).clamp(0, 0.5)
+    rd = ((Wg - level).abs() / step).clamp(0, 0.5)
     outside = (Wg < w_min) | (Wg > w_max)
     rd = torch.where(outside, torch.full_like(rd, 0.5), rd)
     return rd.reshape(K, N)
@@ -72,7 +72,7 @@ def grid_round_mask(imp, W_norm, mask0, gsize, eps):
         return mask0
     rd = round_dist(W_norm, mask0, gsize, NBITS)
     grid_imp = imp * (1.0 - eps * 2.0 * rd).clamp(min=1e-6)
-    sp = 1.0 - mask0.float.mean.item
+    sp = 1.0 - mask0.float().mean().item()
     return ns._threshold_mask(grid_imp, sp, scope='global')
 
 
@@ -90,7 +90,7 @@ def run_model(MODEL, device="cuda", gsize=128):
     acts_all = bs.collect_activations(model, cal, device)
     for _l in ns.get_layers(model):
         _l.to("cpu")
-    torch.cuda.empty_cache
+    torch.cuda.empty_cache()
     layer_paths = bs.get_layer_paths(model)
     layers = ns.get_layers(model)
     n_layers = len(layers)
@@ -117,37 +117,37 @@ def run_model(MODEL, device="cuda", gsize=128):
                 acts = acts_all.get(f'layer_{li}.{ap}')
                 if acts is None:
                     continue
-                W = lin.weight.data.float.to(device)
+                W = lin.weight.data.float().to(device)
                 if W.shape[1] % gsize != 0:
                     continue
-                Xa = acts.to(device).float
-                if Xa.dim == 3:
+                Xa = acts.to(device).float()
+                if Xa.dim() == 3:
                     Xa = Xa.reshape(-1, Xa.shape[-1])
                 Xa = Xa[:min(Xa.shape[0], CAP)]
-                H = Xa.t @ Xa
+                H = Xa.t() @ Xa
                 colE = (Xa * Xa).sum(0).clamp(min=0)
                 an = torch.norm(Xa, dim=0)
                 if supp == "balanced":
                     imp, mask0 = pg.balanced_importance(W, an, SP, BETA)
                 else:
                     imp, mask0 = pg.wanda_importance(W, an, SP)
-                H_inv = compute_hessian_inverse(Xa, damping=None); H_inv_diag = H_inv.diag
+                H_inv = compute_hessian_inverse(Xa, damping=None); H_inv_diag = H_inv.diag()
                 Wc0 = pg.obs_compensate(W, mask0, H_inv, H_inv_diag)
                 c0 = pg.col_scale(Wc0, mask0)
                 Wn0 = Wc0 / c0.view(1, -1)
                 base += pg.eout(pg.rtn_dequant(Wn0, mask0, c0, gsize), W, H)
                 for e in EPS:
                     m1 = grid_round_mask(imp, Wn0, mask0, gsize, e)
-                    nflip[e] += int((m1 != mask0).sum.item) // 2
+                    nflip[e] += int((m1 != mask0).sum().item()) // 2
                     Wc1 = pg.obs_compensate(W, m1, H_inv, H_inv_diag)
                     c1 = pg.col_scale(Wc1, m1)
                     Wn1 = Wc1 / c1.view(1, -1)
                     E[e] += pg.eout(pg.rtn_dequant(Wn1, m1, c1, gsize), W, H)
-                    wcol1 = (c1.float ** 2) * colE
+                    wcol1 = (c1.float() ** 2) * colE
                     Wn1_ac = eq.awclip_quantize(Wn1, m1, NBITS, gsize, wcol1)
-                    E_awc[e] += pg.eout(Wn1_ac * c1.view(1, -1) * m1.float, W, H)
+                    E_awc[e] += pg.eout(Wn1_ac * c1.view(1, -1) * m1.float(), W, H)
                 nmat += 1
-            layers[li] = layer.to("cpu"); torch.cuda.empty_cache
+            layers[li] = layer.to("cpu"); torch.cuda.empty_cache()
         b = max(base, 1e-30)
         row = "  ".join(f"e{e}={E[e]/b:.4f}" for e in EPS)
         rowa = "  ".join(f"e{e}={E_awc[e]/b:.4f}" for e in EPS)
@@ -156,27 +156,27 @@ def run_model(MODEL, device="cuda", gsize=128):
               f"{'WIN' if E[best] < base*0.999 else 'no-win'}; flips@{best}={nflip[best]})", flush=True)
         print(f"[{MODEL}/{supp}]                grid-round+awclip: {rowa}", flush=True)
     del model
-    torch.cuda.empty_cache
+    torch.cuda.empty_cache()
 
 
-def main:
+def main():
     global SP, BETA, NBITS
-    ap = argparse.ArgumentParser
+    ap = argparse.ArgumentParser()
     ap.add_argument("--models", default="gemma-2b,tinyllama,qwen-1.5b")
     ap.add_argument("--gsize", type=int, default=128)
     ap.add_argument("--sp", type=float, default=SP)
     ap.add_argument("--nbits", type=int, default=NBITS)
     ap.add_argument("--beta", type=float, default=BETA)
-    args = ap.parse_args
+    args = ap.parse_args()
     SP, BETA, NBITS = args.sp, args.beta, args.nbits
     print(f"=== G2 grid-round probe sp={SP} beta={BETA} nbits={NBITS} g={args.gsize} ===", flush=True)
     for m in args.models.split(","):
         try:
-            run_model(m.strip, gsize=args.gsize)
+            run_model(m.strip(), gsize=args.gsize)
         except Exception as ex:
             import traceback
-            print(f"[{m}] FAILED: {ex}", flush=True); traceback.print_exc
+            print(f"[{m}] FAILED: {ex}", flush=True); traceback.print_exc()
 
 
 if __name__ == "__main__":
-    main
+    main()
