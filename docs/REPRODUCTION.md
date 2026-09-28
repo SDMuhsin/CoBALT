@@ -7,35 +7,45 @@ Read the whole of §1 before starting: §1.3 in particular will save you an afte
 
 ---
 
-## 0. If you were sent a prebuilt package, skip stages 1 and 2
+## 0. If you were sent the big-files overlay, skip stages 1 and 2
 
-A prebuilt package is a directory containing `model/`, `src/`, `docs/`, `RUN.md` and
-`SHA256SUMS`. **The weights are already built.** You need no Hugging Face checkpoint, no
-calibration data, and none of the hours-long quantization run — stages 1 (§3) and 2 (§4)
-are ours, already done, and nothing on your side re-runs them.
+The repository does not track two things you need: the calibration set (`.gitignore`
+excludes `results/`) and the compressed weights themselves. We ship those separately as a
+**drop-in overlay** — unpack it at the root of your clone and it lands exactly where the
+code already looks for it. It contains no code and no documentation, so there is nothing
+to reconcile against the clone.
 
 ```bash
-cd <package>
-sha256sum -c SHA256SUMS          # optional but cheap; 11 GB transfers do get truncated
-export PYTHONPATH=$PWD/src
+git clone <repo> && cd <repo>
+tar -xf cobalt-bigfiles.tar        # AT THE REPO ROOT; adds results/ and artifacts/
+sha256sum -c SHA256SUMS            # optional; 11 GB transfers do get truncated
 
-python -m prod doctor            # §1.3 -- is the machine ready?
-python -m prod verify   model    # §5   -- ~2 s, no GPU, no kernel build
-python -m prod generate model --prompt "A 54-year-old presents with" -n 64
-python -m prod bench    model --prompt 512 --gen 128 --out bench.json    # §7
+export PYTHONPATH=$PWD/src
+python -m prod doctor                                       # §1.3
+python -m prod verify   artifacts/medgemma-27b-<arm>        # §5, ~2 s, no GPU
+python -m prod generate artifacts/medgemma-27b-<arm> --prompt "A 54-year-old presents with" -n 64
+python -m prod bench    artifacts/medgemma-27b-<arm> --prompt 512 --gen 128 --out bench.json   # §7
 ```
 
-`model/` carries `config.json` and the tokenizer alongside the packed weights, so
-**`--config` is never needed** and the package has no external model dependency. The
-recipe is read out of `model/manifest.json`, so an artifact cannot be paired with the
-wrong kernel configuration.
+What the overlay adds:
 
-Then read §1 (prerequisites), §5 (what verify proves), §7 (the measurement protocol) and
-§8 (where this design does not win). §3 and §4 are background only — read them to
-understand what produced the weights, not as steps to perform.
+| path | what it is | needed for |
+|---|---|---|
+| `artifacts/medgemma-27b-<arm>/` | packed CBK1 weights, plus `config.json` and the tokenizer | everything below |
+| `results/accel4bit/calib_*` | the calibration set the recipes pin | **only** if you re-run stage 1 |
 
-This is the path we recommend for reproducing our published numbers: it removes both the
-calibration data and the quantizer from the set of things that could differ between us,
+**The weights are already built, so stages 1 (§3) and 2 (§4) are already done** — nothing
+on your side runs the quantizer, and reproducing our numbers does not touch the
+calibration file. `--config` is not needed either: `config.json` and the tokenizer sit
+beside the weights, so no Hugging Face download is required. The recipe is read out of
+`manifest.json`, so an artifact cannot be paired with the wrong kernel configuration.
+
+Read §1 (prerequisites), §5 (what verify proves), §7 (the measurement protocol) and §8
+(where this design does not win). §3 and §4 are background — read them to understand what
+produced the weights, not as steps to perform.
+
+This is the path we recommend for reproducing our published numbers: it takes both the
+calibration data and the quantizer out of the set of things that could differ between us,
 so a disagreement can only come from the kernel or the hardware.
 
 ---
@@ -227,7 +237,8 @@ step 3, and — for `blk1632_b6_oproj4` — the code width.
 > * Regenerate ours with `src/accel4bit_dump_calib.py`, which pulls
 >   ultrachat_200k/train_sft and packs it identically (seed 42, 2048 tokens).
 >
-> Or avoid the question entirely and ask us for a prebuilt package (§0).
+> Or avoid the question entirely: the big-files overlay (§0) ships this exact file at
+> this exact path, and reproducing our numbers never runs this stage anyway.
 
 The recipes point at `results/accel4bit/calib_ultrachat_512x2048.txt` (512 sequences from
 ultrachat_200k/train_sft, seed 42, packed to 2048 tokens; the first 128 are used). **Calibrate on text that

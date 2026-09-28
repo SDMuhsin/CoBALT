@@ -5,26 +5,32 @@ quantization pipeline that produces the weights they read.
 
 | document | read it for |
 |---|---|
-| `RUN.md` (prebuilt packages only) | **start here if you received weights** — the four commands, nothing else |
-| [REPRODUCTION.md](REPRODUCTION.md) | set up, build, verify and benchmark the kernels on your own GPU |
+| [REPRODUCTION.md](REPRODUCTION.md) | **start here** — set up, verify, benchmark and serve on your own GPU |
 | [FORMAT.md](FORMAT.md) | the CBK1 weight format: bit layout, bpw accounting, how to write your own reader |
 | [KERNELS.md](KERNELS.md) | how the megakernel is put together, which source does what, what to tune when porting |
 
-## Which of the two paths are you on?
+## The repository is not self-sufficient — you also need the big-files overlay
 
-**A — you received a prebuilt package** (a directory with `model/` in it, or a tarball of
-one). The weights are already built: **skip stages 1 and 2 entirely.** You do not need a
-Hugging Face checkpoint, calibration data, or the hours-long quantization run. Read the
-package's `RUN.md`, then [REPRODUCTION.md](REPRODUCTION.md) §1 (prerequisites), §5
-(verify), §6 (serve), §7 (benchmark) and §8 (where this design does not win).
+`.gitignore` excludes `results/`, and the compressed weights were never in git. So a
+clone gives you all of the code and documentation and **none** of the data. We ship the
+rest as a separate **drop-in overlay** (`cobalt-bigfiles.tar`): unpack it at the root of
+your clone and every path the code already uses resolves.
 
-**B — you are building an artifact from a Hugging Face checkpoint yourself.** Read
-[REPRODUCTION.md](REPRODUCTION.md) start to finish. Note §3: the calibration file the
-recipes pin is a research artifact that is **not in this repository**, so stage 1 cannot
-run until you supply calibration text of your own.
+```bash
+git clone <repo> && cd <repo>
+tar -xf cobalt-bigfiles.tar        # adds results/ and artifacts/, overwrites nothing
+```
 
-Path A is the right one for reproducing our published numbers, because it removes both
-the calibration data and the quantizer from the things that could differ between us.
+It carries the packed weights (with `config.json` and the tokenizer beside them) and the
+calibration set the recipes pin. It deliberately carries no code and no docs — those are
+the clone's job, so the two can never drift apart.
+
+With the overlay in place the weights are already built, so **stages 1 and 2 of
+[REPRODUCTION.md](REPRODUCTION.md) are already done**: no Hugging Face download, no
+calibration pass, no hours-long quantization run. Go to §0, then §5–§8.
+
+Without it, `python -m prod quantize` fails immediately on the missing calibration file —
+see [REPRODUCTION.md](REPRODUCTION.md) §3 for how to substitute your own.
 
 ## What this is, in one paragraph
 
