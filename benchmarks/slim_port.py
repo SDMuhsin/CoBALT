@@ -116,7 +116,7 @@ def slim_quant_find_cap(mat, num_bits, num_bins=None, nonzero_only=False):
 
 
 @torch.no_grad()
-def slim_quantize_weight(mat, num_bits, nonzero_only=False):
+def slim_quantize_weight(mat, num_bits, nonzero_only=False, cap_bins=None):
     """Per-matrix SLiM-Quant: symmetric round-to-nearest with the MSE-optimal cap.
 
     Returns the *dequantized* weight (fake-quant) in **float32** — matching upstream's
@@ -128,9 +128,13 @@ def slim_quantize_weight(mat, num_bits, nonzero_only=False):
     mat)) with slim_quant=True, no block, no important columns. Pruned zeros map to 0.
 
     nonzero_only=True estimates the MSE-optimal cap over surviving weights only (the Study B
-    correction); the round/clamp grid is otherwise unchanged."""
+    correction); the round/clamp grid is otherwise unchanged.
+
+    cap_bins fixes the histogram resolution the cap search runs at (None = upstream's
+    size-dependent default). It changes only which cap is chosen, never what is stored,
+    so it is a bit-budget-preserving knob."""
     max_q = 2 ** (num_bits - 1) - 1
-    cap = slim_quant_find_cap(mat, num_bits, nonzero_only=nonzero_only)
+    cap = slim_quant_find_cap(mat, num_bits, num_bins=cap_bins, nonzero_only=nonzero_only)
     scaling_factor = max_q / cap
     q = torch.round((mat * scaling_factor).float())
     q = torch.clamp(q, -max_q - 1, max_q)
@@ -143,7 +147,8 @@ def slim_quantize_weight(mat, num_bits, nonzero_only=False):
 # --------------------------------------------------------------------------- #
 @torch.no_grad()
 def slim_lora_decompose(weight, W_mask, scaler_row, num_bits, rank_ratio,
-                        quantize=True, slim_lora=True, sparse_aware_cap=False):
+                        quantize=True, slim_lora=True, sparse_aware_cap=False,
+                        cap_bins=None):
     """Port of lora.py::add_lora (slim_lora, separate_lora, quantize_first, fp16 adapter).
 
     Args:
@@ -171,7 +176,8 @@ def slim_lora_decompose(weight, W_mask, scaler_row, num_bits, rank_ratio,
         new_weight = weight.clone()
         if quantize:
             new_weight = slim_quantize_weight(new_weight, num_bits,
-                                              nonzero_only=sparse_aware_cap) * sqrt_act
+                                              nonzero_only=sparse_aware_cap,
+                                              cap_bins=cap_bins) * sqrt_act
         else:
             new_weight = new_weight * sqrt_act
         new_weight[W_mask] = 0
@@ -181,7 +187,8 @@ def slim_lora_decompose(weight, W_mask, scaler_row, num_bits, rank_ratio,
         new_weight = weight.clone()
         if quantize:
             new_weight = slim_quantize_weight(new_weight, num_bits,
-                                              nonzero_only=sparse_aware_cap)
+                                              nonzero_only=sparse_aware_cap,
+                                              cap_bins=cap_bins)
         new_weight[W_mask] = 0
         error_mat = weight - new_weight
 
@@ -206,7 +213,8 @@ def slim_lora_decompose(weight, W_mask, scaler_row, num_bits, rank_ratio,
     if quantize:
         # This is the call where pruned zeros are present (W - LR has been masked), so
         # nonzero_only here is the operative sparse-aware-cap correction.
-        new_weight = slim_quantize_weight(new_weight, num_bits, nonzero_only=sparse_aware_cap)
+        new_weight = slim_quantize_weight(new_weight, num_bits, nonzero_only=sparse_aware_cap,
+                                          cap_bins=cap_bins)
 
     return new_weight.to(dtype), lora_left.to(dtype), lora_right.to(dtype)
 

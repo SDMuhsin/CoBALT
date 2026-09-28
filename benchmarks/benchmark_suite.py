@@ -1668,7 +1668,9 @@ def get_adaptive_nbits(W: torch.Tensor, target_nbits: int,
     return target_nbits
 
 
-def apply_sinq_quantization(model, calibration_data, nbits: int, device: str = 'cuda') -> nn.Module:
+def apply_sinq_quantization(model, calibration_data, nbits: int, device: str = 'cuda',
+                            sinq_order: int = 16, sinq_stop: bool = True,
+                            group_size: int = 128) -> nn.Module:
     """Apply SINQ quantization to model.
 
     Includes automatic detection of problematic layers (with many near-zero rows)
@@ -1704,8 +1706,11 @@ def apply_sinq_quantization(model, calibration_data, nbits: int, device: str = '
             min_max = [0, 2**actual_nbits - 1]
 
             # Apply SINQ quantization
+            # group_size is a BIT-BUDGET lever (an fp16 scale+zero per group), so it is
+            # pinned here to match every other arm; quantize_dual_scale_shift defaults to 64.
             W_q, scales, scale2, zeros = quantize_dual_scale_shift(
-                W, min_max, method='sinq'
+                W, min_max, method='sinq', group_size=group_size,
+                sinkhorn_order=sinq_order, sinkhorn_stop=sinq_stop
             )
 
             new_layer = SINQLinear(W_q, scales, scale2, zeros, bias, actual_nbits)
@@ -2233,12 +2238,14 @@ def apply_wanda_pruning(
     model,
     calibration_data,
     sparsity: float,
-    device: str = 'cuda'
+    device: str = 'cuda',
+    act_exp: float = 0.5,
+    scope: str = 'row'
 ) -> nn.Module:
     """Apply Wanda pruning to model (no quantization).
 
     Wanda (Weights AND Activations) prunes weights based on:
-        importance = |W| * sqrt(activation_norm_squared)
+        importance = |W| * activation_norm_squared ** act_exp
 
     This is the pure Wanda baseline without any quantization.
 
@@ -2247,6 +2254,11 @@ def apply_wanda_pruning(
         calibration_data: Calibration data for collecting activation statistics
         sparsity: Target sparsity ratio (0.35 = 35% weights pruned)
         device: Device to use
+        act_exp: exponent on the activation norm (0.5 = the paper's sqrt). Reweighting the
+            two importance terms leaves the mask's size and the stored format untouched.
+        scope: comparison group the sparsity is enforced over -- 'row' (per output row, the
+            released default) or 'layer' (one threshold for the whole matrix). Wanda's own
+            paper ablates exactly this choice; both keep the same weight count.
 
     Returns:
         Pruned model
@@ -2307,19 +2319,22 @@ def apply_wanda_pruning(
             # Wanda importance: |W| * sqrt(scaler_row)
             # scaler_row is the running mean of squared L2 norms per column
             scaler_row = wrapped_layers[attr_path].scaler_row
-            W_metric = torch.abs(W) * torch.sqrt(scaler_row.reshape(1, -1))
+            W_metric = torch.abs(W) * scaler_row.reshape(1, -1).clamp(min=0) ** act_exp
 
-            # Per-row pruning (unstructured but balanced across rows)
             K, N = W.shape
-            n_prune_per_row = int(N * sparsity)
-
-            # Sort by importance within each row
-            sort_res = torch.sort(W_metric, dim=1, stable=True)
-            indices = sort_res[1][:, :n_prune_per_row]
-
-            # Create mask and set pruned weights to zero
             W_mask = torch.zeros_like(W_metric, dtype=torch.bool)
-            W_mask.scatter_(1, indices, True)
+            if scope == 'layer':
+                # One threshold for the whole matrix: rows compete against each other.
+                n_prune = int(K * N * sparsity)
+                if n_prune > 0:
+                    flat = torch.sort(W_metric.reshape(-1), stable=True)[1][:n_prune]
+                    W_mask.reshape(-1)[flat] = True
+            else:
+                # Per-row pruning (unstructured but balanced across rows)
+                n_prune_per_row = int(N * sparsity)
+                if n_prune_per_row > 0:
+                    indices = torch.sort(W_metric, dim=1, stable=True)[1][:, :n_prune_per_row]
+                    W_mask.scatter_(1, indices, True)
             W[W_mask] = 0
 
             # Replace with sparse linear layer
@@ -2515,7 +2530,8 @@ def apply_jsq_weightonly_quantization(model, calibration_data, nbits: int, spars
 def apply_slim_quantization(model, calibration_data, nbits: int, sparsity: float,
                             device: str = 'cuda', rank_ratio: float = 0.1,
                             quantize_weight: bool = True, slim_lora: bool = True,
-                            sparse_aware_cap: bool = False) -> nn.Module:
+                            sparse_aware_cap: bool = False,
+                            cap_bins: int = None) -> nn.Module:
     """SLiM-LoRA (Mozaffari et al., ICML 2025): the headline joint prune+quant+low-rank method.
 
     Per decoder layer (sequential via the standard per-layer harness, like Wanda/SparseGPT/JSQ):
@@ -2535,6 +2551,11 @@ def apply_slim_quantization(model, calibration_data, nbits: int, sparsity: float
     Env knobs (ablation): SLIM_RANK (rank ratio, default 0.1), SLIM_NO_QUANT=1 (prune-only,
     paper Table 13), SLIM_NAIVE=1 (Naive-LoRA: plain error SVD instead of saliency-weighted),
     SLIM_NSAMPLES (calibration sample cap).
+
+    The bit-budget-preserving knobs are `slim_lora` (saliency-weighted vs naive error SVD),
+    `cap_bins` (histogram resolution of the SLiM-Quant MSE-optimal cap search) and
+    `sparse_aware_cap` (estimate that cap over survivors only). `rank_ratio` is excluded from
+    the matched sweep: it is the knob that buys SLiM its extra bits.
     """
     import sys as _sys, os as _os
     _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
@@ -2608,7 +2629,7 @@ def apply_slim_quantization(model, calibration_data, nbits: int, sparsity: float
             Wc, ll, lr = slim_lora_decompose(
                 W, mask, scaler_row, nbits, rank_ratio,
                 quantize=quantize_weight, slim_lora=slim_lora,
-                sparse_aware_cap=sparse_aware_cap)
+                sparse_aware_cap=sparse_aware_cap, cap_bins=cap_bins)
 
             bias = linear.bias.data.clone() if linear.bias is not None else None
             parts = name.split('.')
@@ -3033,7 +3054,9 @@ class GPTQLayerWrapper:
 
 
 def apply_awq_quantization(model, calibration_data, nbits: int, device: str = 'cuda',
-                           groupsize: int = 128) -> nn.Module:
+                           groupsize: int = 128, awq_num_alphas: int = 20,
+                           awq_num_betas: int = 1, awq_use_weightscale: bool = True,
+                           awq_l1: bool = False) -> nn.Module:
     """Apply AWQ (Activation-aware Weight Quantization, Lin et al. 2023).
 
     Uses the SINQ authors' own AWQ implementation (sinq/awq.py): a grid search
@@ -3066,7 +3089,10 @@ def apply_awq_quantization(model, calibration_data, nbits: int, device: str = 'c
             acts = layer_activations.get(f'layer_{layer_idx}.{attr_path}', None)
             if acts is not None:
                 acts = acts.to(device).float()
-                awq_scales = compute_awq_scale(W, acts, min_max, tile=block, method='awq')
+                awq_scales = compute_awq_scale(W, acts, min_max, tile=block,
+                                               num_alphas=awq_num_alphas, num_betas=awq_num_betas,
+                                               use_weightscale=awq_use_weightscale,
+                                               method='awq_l1' if awq_l1 else 'awq')
             else:
                 awq_scales = torch.ones(N, device=device)
             W_fq = tiled_fake_quant_rectangle(
@@ -3231,7 +3257,10 @@ def apply_wanda_awq_quantization(model, calibration_data, nbits: int, sparsity: 
                                  sparsity_by_type: dict = None, repack: bool = False,
                                  binc: bool = False, awclipz: bool = False,
                                  awclip: bool = False,
-                                 balanced: bool = False, cobalt_beta: float = 0.5, floor_frac: float = 0.0, protect: float = 0.0, adapt: float = 0.0) -> nn.Module:
+                                 balanced: bool = False, cobalt_beta: float = 0.5, floor_frac: float = 0.0, protect: float = 0.0, adapt: float = 0.0,
+                                 awq_num_alphas: int = 20, awq_num_betas: int = 1,
+                                 awq_use_weightscale: bool = True,
+                                 awq_l1: bool = False) -> nn.Module:
     """Wanda pruning + AWQ quantization of the surviving weights.
 
     Composes the existing `wanda` per-row mask with AWQ: prune, AWQ-quantize the
@@ -3243,7 +3272,14 @@ def apply_wanda_awq_quantization(model, calibration_data, nbits: int, sparsity: 
     store survivors in the repacked format (survivor-only b'-bit codes, survivor-hull
     grids at group=128) instead of b-bit codes at every position. Same storage lever
     given to cobalt-repack, applied to this baseline's own normalization.
+
+    AWQ's internal scale search has its own bit-budget-preserving settings: the alpha
+    and beta grid resolutions (beta weights the activation STD alongside the mean, and
+    is off by default at num_betas=1), whether the search divides by the weight scale,
+    and whether reconstruction error is measured in L2 or L1.  All four leave one scale
+    per input channel regardless of setting, so they belong in the matched sweep.
     """
+    _awq_method = 'awq_l1' if awq_l1 else 'awq'
     if repack or binc or awclipz or awclip:
         import sys as _sys, os as _os
         _sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.dirname(
@@ -3281,7 +3317,10 @@ def apply_wanda_awq_quantization(model, calibration_data, nbits: int, sparsity: 
                         else _wanda_row_mask(W, scaler_row, sp))
                 W_pruned = W * mask
                 acts_d = acts.to(device).float()
-                awq_scales = compute_awq_scale(W_pruned, acts_d, min_max, tile=block, method='awq')
+                awq_scales = compute_awq_scale(W_pruned, acts_d, min_max, tile=block,
+                                               num_alphas=awq_num_alphas, num_betas=awq_num_betas,
+                                               use_weightscale=awq_use_weightscale,
+                                               method=_awq_method)
                 if (repack or binc or awclipz or awclip) and sp > 0.0:
                     # AWQ decode is ((q-z)*s) / awq_scales -> c = 1/awq_scales, r = 1.
                     r = torch.ones(W.shape[0], device=device)
@@ -3322,7 +3361,9 @@ def apply_wanda_sinq_quantization(model, calibration_data, nbits: int, sparsity:
                                   device: str = 'cuda', sparsity_by_type: dict = None,
                                   repack: bool = False, binc: bool = False,
                                   awclipz: bool = False, awclip: bool = False,
-                                  balanced: bool = False, cobalt_beta: float = 0.5, floor_frac: float = 0.0, protect: float = 0.0, adapt: float = 0.0) -> nn.Module:
+                                  balanced: bool = False, cobalt_beta: float = 0.5, floor_frac: float = 0.0, protect: float = 0.0, adapt: float = 0.0,
+                                  sinq_order: int = 16, sinq_stop: bool = True,
+                                  group_size: int = 128) -> nn.Module:
     """Wanda pruning + SINQ quantization of the surviving weights.
 
     The naive composition (off-the-shelf SINQ run on the pruned matrix, i.e.
@@ -3334,6 +3375,11 @@ def apply_wanda_sinq_quantization(model, calibration_data, nbits: int, sparsity:
     mu2 row) + Wanda mask, but store survivors in the repacked format (survivor-only
     b'-bit codes, survivor-hull grids at group=128, nbits pinned = no adaptive-nbits
     bpw drift). Same storage lever as cobalt-repack, on SINQ's own normalization.
+
+    `sinq_order` / `sinq_stop` are SINQ's Sinkhorn balancing knobs: the number of
+    iterations, and whether to freeze a sample once its imbalance stops improving.
+    Both leave the stored format untouched (mu1/mu2 are one vector per axis at any
+    order), so they are bit-budget preserving and belong in the matched sweep.
     """
     if repack or binc or awclipz or awclip:
         import sys as _sys, os as _os
@@ -3373,7 +3419,8 @@ def apply_wanda_sinq_quantization(model, calibration_data, nbits: int, sparsity:
 
             if (repack or binc or awclipz or awclip) and sp > 0.0 and acts is not None:
                 # Keep Sinkhorn dual normalization; swap survivor coding (repack/binc/awclip(z)).
-                _, mu1, mu2 = sinkhorn_log(W_pruned.to(device), 16)
+                _, mu1, mu2 = sinkhorn_log(W_pruned.to(device), sinq_order,
+                                           stop_on_increasing_imbalance=sinq_stop)
                 r = mu2.to(device).float().view(-1)            # [K] per-row
                 c = mu1.to(device).float().view(-1)            # [N] per-col
                 if awclip:  # fairness: give the awclip SCALE lever to SINQ too
@@ -3391,7 +3438,11 @@ def apply_wanda_sinq_quantization(model, calibration_data, nbits: int, sparsity:
             else:
                 actual_nbits = get_adaptive_nbits(W_pruned, nbits)
                 min_max = [0, 2 ** actual_nbits - 1]
-                W_q, s1, s2, z = quantize_dual_scale_shift(W_pruned, min_max, method='sinq')
+                # group_size is a BIT-BUDGET lever (an fp16 scale+zero per group), so it is
+                # pinned here to match every other arm; quantize_dual_scale_shift defaults to 64.
+                W_q, s1, s2, z = quantize_dual_scale_shift(
+                    W_pruned, min_max, method='sinq', group_size=group_size,
+                    sinkhorn_order=sinq_order, sinkhorn_stop=sinq_stop)
                 W_deq = _sinq_dequantize_dense(W_q, s1, s2, z) * mask
 
             new_layer = SparseLinear(W_deq.to(linear.weight.dtype), bias).to(device)

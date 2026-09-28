@@ -204,7 +204,8 @@ def quantize_symmetric_rtn(matrix, min_max, niter=None):
 def dequantize_symmetric_rtn(q, scales, dtype):
     return (q*scales).to(dtype)
 
-def quantize_dual_scale_shift(matrix, min_max, method='sinq', awq_scale=None, group_size=64):
+def quantize_dual_scale_shift(matrix, min_max, method='sinq', awq_scale=None, group_size=64,
+                              sinkhorn_order=16, sinkhorn_stop=True):
     """
     SINQ quantization with dual-scale approach (Sinkhorn normalization + RTN).
 
@@ -215,6 +216,9 @@ def quantize_dual_scale_shift(matrix, min_max, method='sinq', awq_scale=None, gr
         awq_scale: Optional AWQ-style activation-aware scales
         group_size: Group size for quantization (default 64). Use None for per-row.
                    Group-wise quantization significantly reduces error at low bitwidths.
+        sinkhorn_order: number of Sinkhorn balancing iterations (default 16). Bit-budget
+                   preserving -- the mu1/mu2 vectors are the same size at any order.
+        sinkhorn_stop: stop early once the imbalance stops improving (SINQ's default).
 
     Returns:
         q: Quantized tensor [K, N]
@@ -234,7 +238,8 @@ def quantize_dual_scale_shift(matrix, min_max, method='sinq', awq_scale=None, gr
 
     # normalize the matrix with sinkhorn inspired std.dev. scaling
     # matrix, mu1, mu2 = min_kurt_vectors_vmap(matrix,32) # for kurtosis exp.
-    matrix, mu1, mu2 = sinkhorn_log(matrix, 16)
+    matrix, mu1, mu2 = sinkhorn_log(matrix, sinkhorn_order,
+                                    stop_on_increasing_imbalance=sinkhorn_stop)
 
     if not ('sinq' in method):
         matrix = matrix * mu1 * mu2

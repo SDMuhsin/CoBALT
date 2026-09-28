@@ -92,11 +92,11 @@ def _threshold_mask(importance, sparsity, scope='global'):
         if k_prune <= 0:
             return torch.ones_like(importance)
         thr = torch.kthvalue(importance, k_prune, dim=1, keepdim=True).values  # [K,1]
-        return (importance > thr).float
+        return (importance > thr).float()
     n_prune = int(K * N * sparsity)
     flat = importance.view(-1)
     thr = torch.kthvalue(flat, n_prune).values
-    return (flat > thr).view(K, N).float
+    return (flat > thr).view(K, N).float()
 
 
 def wanda_mask_and_obs(W, X, sparsity, device, scope='global', act_exp=1.0):
@@ -106,20 +106,20 @@ def wanda_mask_and_obs(W, X, sparsity, device, scope='global', act_exp=1.0):
     mask effectively raises the ‖X‖ exponent. This is the closed-form, non-Sinkhorn analog.
     Returns (W_compensated, mask). Wanda+OBS path mirrors sparse_with_prism, no sinkhorn_log."""
     K, N = W.shape
-    W = W.float.to(device)
+    W = W.float().to(device)
     if sparsity <= 0.0:
-        return W.clone, torch.ones(K, N, device=device)
-    X = X.float.to(device)
-    if X.dim == 3:
+        return W.clone(), torch.ones(K, N, device=device)
+    X = X.float().to(device)
+    if X.dim() == 3:
         X = X.reshape(-1, X.shape[-1])
     X = X[:min(X.shape[0], 256)]
     act_norms = torch.norm(X, dim=0)                       # [N], L2 per input channel
-    importance = W.abs * act_norms.view(1, -1).pow(act_exp)  # Wanda, activation exponent
+    importance = W.abs() * act_norms.view(1, -1).pow(act_exp)  # Wanda, activation exponent
     mask = _threshold_mask(importance, sparsity, scope)
     # OBS compensation (Hessian only; Sinkhorn-free)
     H_inv = compute_hessian_inverse(X, damping=None)
-    H_inv_diag = H_inv.diag
-    W_comp = W.clone
+    H_inv_diag = H_inv.diag()
+    W_comp = W.clone()
     for i in range(K):
         pruned = W[i] * (1.0 - mask[i])
         comp = -H_inv @ (pruned / H_inv_diag)
@@ -132,14 +132,14 @@ def balanced_keepmask_local(imp, sparsity, col_exp):
     importance map imp[K,N]. Standalone version used by candidate-generating levers (balanced_stoch)."""
     K, N = imp.shape
     kr, kc = int(N * sparsity), int(K * sparsity)
-    imp = imp.clone
+    imp = imp.clone()
     if kr > 0:
         imp = imp / torch.kthvalue(imp, kr, dim=1, keepdim=True).values.clamp(min=1e-30)
     if kc > 0:
         imp = imp / torch.kthvalue(imp, kc, dim=0, keepdim=True).values.clamp(min=1e-30).pow(col_exp)
     n_prune = int(K * N * sparsity)
     thr = torch.kthvalue(imp.reshape(-1), n_prune).values
-    return (imp.reshape(-1) > thr).view(K, N).float
+    return (imp.reshape(-1) > thr).view(K, N).float()
 
 
 def column_floor_mask(base_mask, imp, sparsity, floor_frac):
@@ -163,10 +163,10 @@ def column_floor_mask(base_mask, imp, sparsity, floor_frac):
     f = int(round(floor_frac * (1.0 - sparsity) * K))
     if f <= 0:
         return base_mask
-    surv = base_mask.bool
+    surv = base_mask.bool()
     col_cnt = surv.sum(dim=0)                                  # [N] survivors per column
     deficit = (f - col_cnt).clamp(min=0)                       # [N] to add per column
-    total_add = int(deficit.sum.item)
+    total_add = int(deficit.sum().item())
     if total_add == 0:
         return base_mask
     NEG, POS = float('-inf'), float('inf')
@@ -183,17 +183,17 @@ def column_floor_mask(base_mask, imp, sparsity, floor_frac):
     within = (torch.arange(K, device=dev).view(K, 1) < surplus.view(1, N))  # weakest `surplus_c` per col
     removable = torch.zeros_like(surv)
     removable.scatter_(0, asc, within)                         # removable survivors (floor-safe)
-    imp_flat = imp.reshape(-1).clone
+    imp_flat = imp.reshape(-1).clone()
     imp_flat[~removable.reshape(-1)] = POS
     order = torch.argsort(imp_flat)                            # ascending; weakest removable first
     demote_idx = order[:total_add]
     demote = torch.zeros(K * N, dtype=torch.bool, device=dev)
     demote[demote_idx] = True
     demote = demote.view(K, N)
-    new_mask = surv.clone
+    new_mask = surv.clone()
     new_mask[promote] = True
     new_mask[demote] = False
-    return new_mask.float
+    return new_mask.float()
 
 
 def exact_doubly_balanced_mask(imp, sparsity):
@@ -211,8 +211,8 @@ def exact_doubly_balanced_mask(imp, sparsity):
         return torch.zeros_like(imp)
     dev = imp.device
     order = torch.argsort(imp.reshape(-1), descending=True)
-    od = order.to('cpu').numpy
-    ro = (order // N).to('cpu').numpy; co = (order % N).to('cpu').numpy
+    od = order.to('cpu').numpy()
+    ro = (order // N).to('cpu').numpy(); co = (order % N).to('cpu').numpy()
     rc = [0] * K; cc = [0] * N
     keepl = bytearray(K * N)
     full_rows = 0
@@ -233,7 +233,7 @@ def exact_doubly_balanced_mask(imp, sparsity):
 
 
 def balanced_mask_and_obs(W, X, sparsity, device, col_exp=1.0, row_fair=True, per_row_thresh=False,
-                          no_obs=False, imp_base=None):
+                          no_obs=False, imp_base=None, mask_block=0):
     """COLUMN-BALANCED Wanda mask + OBS. NON-Sinkhorn, motivated by a DIRECT measurement
     (diag_column_balance): inverse-μ's downstream win = it keeps a COLUMN-BALANCED survivor set
     (lowest per-column keep-CV + fewest dead columns in EVERY matrix), whereas saliency masks
@@ -246,11 +246,11 @@ def balanced_mask_and_obs(W, X, sparsity, device, col_exp=1.0, row_fair=True, pe
     not Sinkhorn). col_exp=β scales the column-balancing strength: β=0 ⇒ per-row Wanda (F, rows only);
     β=1 ⇒ full column balance. Returns (W_compensated, mask)."""
     K, N = W.shape
-    W = W.float.to(device)
+    W = W.float().to(device)
     if sparsity <= 0.0:
-        return W.clone, torch.ones(K, N, device=device)
-    X = X.float.to(device)
-    if X.dim == 3:
+        return W.clone(), torch.ones(K, N, device=device)
+    X = X.float().to(device)
+    if X.dim() == 3:
         X = X.reshape(-1, X.shape[-1])
     X = X[:min(X.shape[0], 256)]
     act_norms = torch.norm(X, dim=0)                       # [N]
@@ -259,9 +259,9 @@ def balanced_mask_and_obs(W, X, sparsity, device, col_exp=1.0, row_fair=True, pe
         # with |W|.sqrt(E[g_i^2 x_j^2]) -- the NON-separable g-x correlation is the only signal that can
         # move the balanced survivor set (src/probe_within_mask.py row-absorption result). Same balanced
         # row+col quantile thresholding + same OBS below.
-        imp = imp_base.to(device).float
+        imp = imp_base.to(device).float()
     else:
-        imp = W.abs * act_norms.view(1, -1)              # Wanda base
+        imp = W.abs() * act_norms.view(1, -1)              # Wanda base
     kr, kc = int(N * sparsity), int(K * sparsity)
     if per_row_thresh:
         # UNIMPEACHABLY non-Sinkhorn variant: a SINGLE per-column reweighting (like AWQ's per-column
@@ -280,7 +280,23 @@ def balanced_mask_and_obs(W, X, sparsity, device, col_exp=1.0, row_fair=True, pe
         if col_exp > 0 and kc > 0:                         # column self-normalization (the NEW lever)
             qc = torch.kthvalue(imp, kc, dim=0, keepdim=True).values.clamp(min=1e-30)  # [1,N]
             imp = imp / qc.pow(col_exp)
-        mask = _threshold_mask(imp, sparsity, scope='global')  # shared budget ⇒ balance is meaningful
+        if mask_block and mask_block > 0:
+            # FIXED-CARDINALITY selection (CoBALT-B:2B). The row/column normalization above is
+            # untouched; only the single global threshold is replaced by a per-block top-k, so each
+            # aligned block of `mask_block` input columns keeps exactly block-int(block*sparsity)
+            # survivors and the row stride of a packed artifact is constant. Selection is now within
+            # a row, so the row self-normalization acts only through the column quantiles, and at
+            # col_exp=0 it does not act at all. Mirrors cobaltkernel.cobalt_math.blocked_keepmask
+            # (whose global rescale is a positive scalar and cannot change either selection).
+            assert N % mask_block == 0, f"N={N} not divisible by mask_block={mask_block}"
+            keep = mask_block - int(mask_block * sparsity)
+            v = imp.reshape(K, N // mask_block, mask_block)
+            idx = torch.topk(v, keep, dim=-1).indices
+            mask = torch.zeros_like(v)
+            mask.scatter_(-1, idx, 1.0)
+            mask = mask.reshape(K, N)
+        else:
+            mask = _threshold_mask(imp, sparsity, scope='global')  # shared budget ⇒ balance is meaningful
     if no_obs:
         # ABLATION Factor C = OFF: drop OBS error-redistribution entirely. The mask is computed
         # IDENTICALLY above (byte-identical for a given col_exp) so this is orthogonal to Factor M;
@@ -288,8 +304,8 @@ def balanced_mask_and_obs(W, X, sparsity, device, col_exp=1.0, row_fair=True, pe
         return W * mask, mask
     # OBS compensation (identical to every other recipe)
     H_inv = compute_hessian_inverse(X, damping=None)
-    H_inv_diag = H_inv.diag
-    W_comp = W.clone
+    H_inv_diag = H_inv.diag()
+    W_comp = W.clone()
     for i in range(K):
         pruned = W[i] * (1.0 - mask[i])
         comp = -H_inv @ (pruned / H_inv_diag)
@@ -308,7 +324,7 @@ def _grid_swap_support(W_norm, mask, energy, gsize):
     2-bit (coarse grid, hull dominates) CoBALT-specifically; NEUTRAL/harmful >=3-bit (do not use).
     Returns the new boolean keep-mask [K,N] (float)."""
     K, N = W_norm.shape
-    m = mask.bool
+    m = mask.bool()
     if not (N > gsize and N % gsize == 0):
         return mask
     ng = N // gsize
@@ -319,23 +335,23 @@ def _grid_swap_support(W_norm, mask, energy, gsize):
     w_max = torch.where(Mg, Wg, torch.full_like(Wg, -big)).amax(-1, keepdim=True)
     valid = Mg.any(-1, keepdim=True)
     mid = 0.5 * (w_min + w_max)
-    dev = torch.where(Mg, (Wg - mid).abs, torch.full_like(Wg, -big))
+    dev = torch.where(Mg, (Wg - mid).abs(), torch.full_like(Wg, -big))
     top2 = dev.topk(2, dim=-1).values
     s_dev = top2[..., 0:1]; new_half = top2[..., 1:2].clamp(min=0)
     s_idx = dev.argmax(-1, keepdim=True)
     ext_E = torch.gather(Eg, -1, s_idx)
     med_E = torch.where(Mg, Eg, torch.full_like(Eg, big)).median(-1, keepdim=True).values
-    dev_p = (Wg - mid).abs
+    dev_p = (Wg - mid).abs()
     interior = (~Mg) & (dev_p <= new_half)
     cand_E = torch.where(interior, Eg, torch.full_like(Eg, -big))
     p_idx = cand_E.argmax(-1, keepdim=True)
     fire = (valid & interior.any(-1, keepdim=True) & (s_dev > 0) & (ext_E < med_E)).squeeze(-1)
-    Mg_new = Mg.clone
+    Mg_new = Mg.clone()
     ar = torch.arange(K, device=W_norm.device).view(-1, 1).expand(K, ng)[fire]
     ag = torch.arange(ng, device=W_norm.device).view(1, -1).expand(K, ng)[fire]
     Mg_new[ar, ag, s_idx.squeeze(-1)[fire]] = False
     Mg_new[ar, ag, p_idx.squeeze(-1)[fire]] = True
-    return Mg_new.reshape(K, N).float
+    return Mg_new.reshape(K, N).float()
 
 
 def grid_balanced_mask_and_obs(W, X, sparsity, device, col_exp=1.0, gsize=None, no_obs=False):
@@ -350,25 +366,25 @@ def grid_balanced_mask_and_obs(W, X, sparsity, device, col_exp=1.0, gsize=None, 
     gsize = GROUP_SIZE if gsize is None else int(gsize)
     K, N = W.shape
     if sparsity <= 0.0:
-        Wf = W.float.to(device)
-        return Wf.clone, torch.ones(K, N, device=device)
+        Wf = W.float().to(device)
+        return Wf.clone(), torch.ones(K, N, device=device)
     # pass 1: balanced mask + OBS + col-scale
     W_comp0, mask0 = balanced_mask_and_obs(W, X, sparsity, device, col_exp=col_exp)
     _, c0 = compute_norm_scales(W_comp0, mask0, 'col', device)
     W_norm0 = W_comp0 / c0.view(1, -1)
-    Xf = X.float.to(device)
-    if Xf.dim == 3:
+    Xf = X.float().to(device)
+    if Xf.dim() == 3:
         Xf = Xf.reshape(-1, Xf.shape[-1])
     Xf = Xf[:min(Xf.shape[0], 256)]
     colE = (Xf * Xf).sum(0).clamp(min=0)                        # ||X_j||^2 [N]
-    energy_norm = (c0.float ** 2) * colE                      # diag output weight in norm space
+    energy_norm = (c0.float() ** 2) * colE                      # diag output weight in norm space
     mask1 = _grid_swap_support(W_norm0, mask0, energy_norm, gsize)
-    Wf = W.float.to(device)
+    Wf = W.float().to(device)
     if no_obs:
         return Wf * mask1, mask1
     # pass 2: re-OBS on the swapped support (identical one-shot batch OBS, vectorized)
     H_inv = compute_hessian_inverse(Xf, damping=None)
-    H_inv_diag = H_inv.diag
+    H_inv_diag = H_inv.diag()
     P = (Wf * (1.0 - mask1)) / H_inv_diag.view(1, -1)
     W_comp1 = (Wf - P @ H_inv) * mask1
     return W_comp1, mask1
@@ -402,15 +418,15 @@ def sens_wanda_mask_and_obs(W, X, sparsity, device, scope='global', sens_row=Non
     on a fair baseline. Closed-form (one kthvalue/row), non-Sinkhorn, < PRISM calibration.
     Returns (W_compensated, mask)."""
     K, N = W.shape
-    W = W.float.to(device)
+    W = W.float().to(device)
     if sparsity <= 0.0:
-        return W.clone, torch.ones(K, N, device=device)
-    X = X.float.to(device)
-    if X.dim == 3:
+        return W.clone(), torch.ones(K, N, device=device)
+    X = X.float().to(device)
+    if X.dim() == 3:
         X = X.reshape(-1, X.shape[-1])
     X = X[:min(X.shape[0], 256)]
     act_norms = torch.norm(X, dim=0)                       # [N], L2 per input channel
-    importance = W.abs * act_norms.view(1, -1)           # Wanda base saliency
+    importance = W.abs() * act_norms.view(1, -1)           # Wanda base saliency
     if fair:                                               # row-fair: normalize by per-row (1-sp) quantile
         k_prune = int(N * sparsity)
         if k_prune > 0:
@@ -418,13 +434,13 @@ def sens_wanda_mask_and_obs(W, X, sparsity, device, scope='global', sens_row=Non
             importance = importance / q                    # each row crosses 1.0 at its own (1-sp) point
         scope = 'global'                                   # fairness is meaningful only for a shared budget
     if sens_row is not None:
-        s = sens_row.to(device).float.clamp(min=0).view(-1)  # [K] per-output-channel sensitivity
+        s = sens_row.to(device).float().clamp(min=0).view(-1)  # [K] per-output-channel sensitivity
         importance = importance * s.pow(sens_exp).view(-1, 1)  # tilt budget toward high-sensitivity rows
     mask = _threshold_mask(importance, sparsity, scope)
     # OBS compensation (identical to wanda_mask_and_obs / sparse_with_prism)
     H_inv = compute_hessian_inverse(X, damping=None)
-    H_inv_diag = H_inv.diag
-    W_comp = W.clone
+    H_inv_diag = H_inv.diag()
+    W_comp = W.clone()
     for i in range(K):
         pruned = W[i] * (1.0 - mask[i])
         comp = -H_inv @ (pruned / H_inv_diag)
@@ -443,31 +459,31 @@ def fisher_sal_mask_and_obs(W, X, sparsity, device, scope='global', fisher_M=Non
     prune smallest (global or per_row), then the SAME OBS as every other recipe. Fully non-Sinkhorn,
     one backward pass (≤ PRISM). Falls back to Wanda ‖X‖² if M is missing. Returns (W_comp, mask)."""
     K, N = W.shape
-    W = W.float.to(device)
+    W = W.float().to(device)
     if sparsity <= 0.0:
-        return W.clone, torch.ones(K, N, device=device)
-    X = X.float.to(device)
-    if X.dim == 3:
+        return W.clone(), torch.ones(K, N, device=device)
+    X = X.float().to(device)
+    if X.dim() == 3:
         X = X.reshape(-1, X.shape[-1])
     X = X[:min(X.shape[0], 256)]
     if fisher_M is not None:
-        M = fisher_M.to(device).float.clamp(min=1e-30)   # [K,N] = E[g_i² x_j²]
+        M = fisher_M.to(device).float().clamp(min=1e-30)   # [K,N] = E[g_i² x_j²]
         if shrink < 1.0:
             # Robustness knob (the S=256 over-fit lesson): shrink the NOISY within-row INTERACTION
             # toward the robust rank-1 (row×col) log-factorization. λ=1 exact Fisher; λ=0 rank-1
             # (per-row column ordering → row-independent ≈ Wanda within-row); 0<λ<1 partial signal.
-            L = M.log
-            g = L.mean; rdev = L.mean(1, keepdim=True) - g; cdev = L.mean(0, keepdim=True) - g
+            L = M.log()
+            g = L.mean(); rdev = L.mean(1, keepdim=True) - g; cdev = L.mean(0, keepdim=True) - g
             base = g + rdev + cdev                          # additive 2-way model (no interaction)
-            M = (base + shrink * (L - base)).exp
+            M = (base + shrink * (L - base)).exp()
     else:                                                   # fallback: Wanda (G=I)
         M = (X * X).sum(0).clamp(min=0).view(1, -1).expand(K, N)
     saliency = M * (W * W)                                  # F_ij · w_ij²  (2nd-order pruning cost)
     mask = _threshold_mask(saliency, sparsity, scope)
     # OBS compensation (identical to every other mask path)
     H_inv = compute_hessian_inverse(X, damping=None)
-    H_inv_diag = H_inv.diag
-    W_comp = W.clone
+    H_inv_diag = H_inv.diag()
+    W_comp = W.clone()
     for i in range(K):
         pruned = W[i] * (1.0 - mask[i])
         comp = -H_inv @ (pruned / H_inv_diag)
@@ -483,32 +499,32 @@ def inverse_mu_mask_and_obs(W, X, sparsity, device, n_iter=2, scope='global'):
     n_iter iterative refinement of importance = |W|·‖X‖/(μ1μ2), then identical OBS.
     Returns (W_compensated, mask) — the rest of the nosink pipeline is unchanged."""
     K, N = W.shape
-    W = W.float.to(device)
+    W = W.float().to(device)
     if sparsity <= 0.0:
-        return W.clone, torch.ones(K, N, device=device)
+        return W.clone(), torch.ones(K, N, device=device)
     if _sinkhorn_log is None:
         raise RuntimeError("sinkhorn_log unavailable (needed for inverse-μ mask)")
-    X = X.float.to(device)
-    if X.dim == 3:
+    X = X.float().to(device)
+    if X.dim() == 3:
         X = X.reshape(-1, X.shape[-1])
     X = X[:min(X.shape[0], 256)]
     act_norms = torch.norm(X, dim=0)                       # [N], L2 per input channel
     n_prune = int(K * N * sparsity)
     mask = torch.ones(K, N, device=device)
-    current_W = W.clone
+    current_W = W.clone()
     for _ in range(n_iter):                                # iterative μ refinement (n=2)
-        W_for_sink = current_W.clone
-        zero = current_W.abs < 1e-10
-        if zero.any:
-            W_for_sink[zero] = torch.randn(int(zero.sum.item), device=device) * 1e-8
+        W_for_sink = current_W.clone()
+        zero = current_W.abs() < 1e-10
+        if zero.any():
+            W_for_sink[zero] = torch.randn(int(zero.sum().item()), device=device) * 1e-8
         _, mu1, mu2 = _sinkhorn_log(W_for_sink, order=16)  # mu1=[N] col, mu2=[K] row
-        importance = W.abs * act_norms.view(1, -1) / (mu1.view(1, -1) * mu2.view(-1, 1) + 1e-6)
+        importance = W.abs() * act_norms.view(1, -1) / (mu1.view(1, -1) * mu2.view(-1, 1) + 1e-6)
         mask = _threshold_mask(importance, sparsity, scope)  # global=PRISM; per_row=diagnostic
         current_W = W * mask
     # OBS compensation (identical to wanda_mask_and_obs / sparse_with_prism)
     H_inv = compute_hessian_inverse(X, damping=None)
-    H_inv_diag = H_inv.diag
-    W_comp = W.clone
+    H_inv_diag = H_inv.diag()
+    W_comp = W.clone()
     for i in range(K):
         pruned = W[i] * (1.0 - mask[i])
         comp = -H_inv @ (pruned / H_inv_diag)
@@ -526,11 +542,11 @@ def scale_mask_and_obs(W, X, sparsity, device, n_iter=2, scope='global'):
     calibration than PRISM. OBS is identical to the wanda/inverse_mu paths.
     Returns (W_compensated, mask)."""
     K, N = W.shape
-    W = W.float.to(device)
+    W = W.float().to(device)
     if sparsity <= 0.0:
-        return W.clone, torch.ones(K, N, device=device)
-    X = X.float.to(device)
-    if X.dim == 3:
+        return W.clone(), torch.ones(K, N, device=device)
+    X = X.float().to(device)
+    if X.dim() == 3:
         X = X.reshape(-1, X.shape[-1])
     X = X[:min(X.shape[0], 256)]
     act_norms = torch.norm(X, dim=0)                       # [N], L2 per input channel
@@ -538,12 +554,12 @@ def scale_mask_and_obs(W, X, sparsity, device, n_iter=2, scope='global'):
     for _ in range(n_iter):                                # closed-form scale refinement
         col_scale = _masked_std(W, mask, dim=0)            # [N] per-col scale (survivors)
         row_scale = _masked_std(W, mask, dim=1)            # [K] per-row scale (survivors)
-        importance = W.abs * act_norms.view(1, -1) / (col_scale.view(1, -1) * row_scale.view(-1, 1))
+        importance = W.abs() * act_norms.view(1, -1) / (col_scale.view(1, -1) * row_scale.view(-1, 1))
         mask = _threshold_mask(importance, sparsity, scope)
     # OBS compensation (identical to wanda_mask_and_obs / inverse_mu_mask_and_obs)
     H_inv = compute_hessian_inverse(X, damping=None)
-    H_inv_diag = H_inv.diag
-    W_comp = W.clone
+    H_inv_diag = H_inv.diag()
+    W_comp = W.clone()
     for i in range(K):
         pruned = W[i] * (1.0 - mask[i])
         comp = -H_inv @ (pruned / H_inv_diag)
@@ -562,11 +578,11 @@ def dual_mask_and_obs(W, X, sparsity, device, n_iter=2, scope='global'):
     non-Sinkhorn; calibration < PRISM. Under scope='per_row' the /row_scale is a within-row
     no-op → pure /dual_c (needs only the perfect μ1 proxy). Returns (W_compensated, mask)."""
     K, N = W.shape
-    W = W.float.to(device)
+    W = W.float().to(device)
     if sparsity <= 0.0:
-        return W.clone, torch.ones(K, N, device=device)
-    X = X.float.to(device)
-    if X.dim == 3:
+        return W.clone(), torch.ones(K, N, device=device)
+    X = X.float().to(device)
+    if X.dim() == 3:
         X = X.reshape(-1, X.shape[-1])
     X = X[:min(X.shape[0], 256)]
     act_norms = torch.norm(X, dim=0)                       # [N]
@@ -574,11 +590,11 @@ def dual_mask_and_obs(W, X, sparsity, device, n_iter=2, scope='global'):
     for _ in range(n_iter):                                # closed-form dual refinement
         row_scale = _masked_std(W, mask, dim=1).clamp(min=1e-8)          # [K] ≈ μ2
         dual_c = _masked_std(W / row_scale.view(-1, 1), mask, dim=0)     # [N] ≈ μ1
-        importance = W.abs * act_norms.view(1, -1) / (dual_c.view(1, -1) * row_scale.view(-1, 1))
+        importance = W.abs() * act_norms.view(1, -1) / (dual_c.view(1, -1) * row_scale.view(-1, 1))
         mask = _threshold_mask(importance, sparsity, scope)
     H_inv = compute_hessian_inverse(X, damping=None)
-    H_inv_diag = H_inv.diag
-    W_comp = W.clone
+    H_inv_diag = H_inv.diag()
+    W_comp = W.clone()
     for i in range(K):
         pruned = W[i] * (1.0 - mask[i])
         comp = -H_inv @ (pruned / H_inv_diag)
@@ -586,7 +602,7 @@ def dual_mask_and_obs(W, X, sparsity, device, n_iter=2, scope='global'):
     return W_comp, mask
 
 
-def obs_saliency_mask_and_obs(W, X, sparsity, device, scope='per_row'):
+def obs_saliency_mask_and_obs(W, X, sparsity, device, scope='per_row', damp_frac=None):
     """NON-Sinkhorn OBS/SparseGPT-style saliency mask + OBS compensation, REUSING the
     same Hessian inverse OBS needs (no extra calibration; strictly < PRISM, no Sinkhorn).
     saliency_ij = W_ij² / [H⁻¹]_jj = the one-shot loss increase from pruning w_ij given
@@ -597,18 +613,18 @@ def obs_saliency_mask_and_obs(W, X, sparsity, device, scope='per_row'):
     NO row-scale proxy is needed — sidestepping cell-E's marginal-row_std failure; the
     per-column [H⁻¹]_jj already handles column fairness. Returns (W_compensated, mask)."""
     K, N = W.shape
-    W = W.float.to(device)
+    W = W.float().to(device)
     if sparsity <= 0.0:
-        return W.clone, torch.ones(K, N, device=device)
-    X = X.float.to(device)
-    if X.dim == 3:
+        return W.clone(), torch.ones(K, N, device=device)
+    X = X.float().to(device)
+    if X.dim() == 3:
         X = X.reshape(-1, X.shape[-1])
     X = X[:min(X.shape[0], 256)]
-    H_inv = compute_hessian_inverse(X, damping=None)
-    H_inv_diag = H_inv.diag.clamp(min=1e-12)             # [N] = [H⁻¹]_jj
+    H_inv = compute_hessian_inverse(X, damping=None, damp_frac=damp_frac)
+    H_inv_diag = H_inv.diag().clamp(min=1e-12)             # [N] = [H⁻¹]_jj
     saliency = (W ** 2) / H_inv_diag.view(1, -1)           # [K,N] OBS one-shot saliency
     mask = _threshold_mask(saliency, sparsity, scope)
-    W_comp = W.clone
+    W_comp = W.clone()
     for i in range(K):                                     # OBS with the SAME H_inv
         pruned = W[i] * (1.0 - mask[i])
         comp = -H_inv @ (pruned / H_inv_diag)
@@ -627,7 +643,7 @@ def _masked_std(W, mask, dim, eps=1e-8):
     else:
         centered = (W - mean.view(-1, 1)) * mask
     var = (centered ** 2).sum(dim=dim) / cnt
-    return var.sqrt.clamp(min=eps)
+    return var.sqrt().clamp(min=eps)
 
 
 def _robust_scale(s, ratio=10.0):
@@ -637,7 +653,7 @@ def _robust_scale(s, ratio=10.0):
     clamp. Reconstruction is unaffected by the centering (group-RTN is scale
     invariant per row); the clamp only bounds pathological columns."""
     s = torch.nan_to_num(s, nan=1.0, posinf=1.0, neginf=1.0).clamp(min=1e-8)
-    gm = s.log.mean.exp
+    gm = s.log().mean().exp()
     return (s / gm).clamp(min=1.0 / ratio, max=ratio)
 
 
@@ -674,8 +690,8 @@ def compute_norm_scales(W_comp, mask, norm, device, act_abs=None, awq_alpha=0.5)
         if act_abs is None:
             raise RuntimeError("acol needs activations")
         cnt = mask.sum(dim=0).clamp(min=1.0)
-        mu_w = ((W_comp.abs * mask).sum(dim=0) / cnt).clamp(min=1e-8)   # sparse-aware col |W|
-        mu_x = act_abs.to(device).float.clamp(min=1e-8)                # [N] mean|X| per channel
+        mu_w = ((W_comp.abs() * mask).sum(dim=0) / cnt).clamp(min=1e-8)   # sparse-aware col |W|
+        mu_x = act_abs.to(device).float().clamp(min=1e-8)                # [N] mean|X| per channel
         a = float(awq_alpha)
         c = _robust_scale(mu_w.pow(1.0 - a) / mu_x.pow(a))
         return ones_r, c
@@ -686,7 +702,7 @@ def compute_norm_scales(W_comp, mask, norm, device, act_abs=None, awq_alpha=0.5)
         r = _masked_std(W_comp, mask, dim=1).clamp(min=1e-8)
         W1 = W_comp / r.view(-1, 1)
         c_std = _masked_std(W1, mask, dim=0)
-        mu_x = act_abs.to(device).float.clamp(min=1e-8)
+        mu_x = act_abs.to(device).float().clamp(min=1e-8)
         a = float(awq_alpha)
         c = _robust_scale(c_std / mu_x.pow(a))
         return r, c
@@ -694,17 +710,17 @@ def compute_norm_scales(W_comp, mask, norm, device, act_abs=None, awq_alpha=0.5)
         if _sinkhorn_log is None:
             raise RuntimeError("sinkhorn_log unavailable")
         W_sparse = W_comp * mask
-        zero = W_sparse.abs < 1e-10
-        if zero.any:
-            W_sparse = W_sparse.clone
-            W_sparse[zero] = torch.randn(int(zero.sum.item), device=device) * 1e-8
+        zero = W_sparse.abs() < 1e-10
+        if zero.any():
+            W_sparse = W_sparse.clone()
+            W_sparse[zero] = torch.randn(int(zero.sum().item()), device=device) * 1e-8
         _, mu1, mu2 = _sinkhorn_log(W_sparse, order=16)
-        return mu2.to(device).float.view(-1), mu1.to(device).float.view(-1)
+        return mu2.to(device).float().view(-1), mu1.to(device).float().view(-1)
     if norm == "sinkhorn_sa":  # DIAGNOSTIC: PRISM's sparse-aware final Sinkhorn (req#3 forbids)
         if _sinkhorn_sa is None:
             raise RuntimeError("sinkhorn_log_sparse_aware unavailable")
         _, mu1, mu2 = _sinkhorn_sa(W_comp * mask, mask, order=16)
-        return mu2.to(device).float.view(-1), mu1.to(device).float.view(-1)
+        return mu2.to(device).float().view(-1), mu1.to(device).float().view(-1)
     raise ValueError(f"unknown norm {norm}")
 
 
@@ -744,17 +760,17 @@ def allocate_sparsity(sm, model, target_sp, sp_min=0.3, sp_max=0.7):
             s = float(sm.get(key, 0.0))
             if s <= 0:
                 continue
-            info[key] = (s / max(K, 1), mod.weight.numel)
+            info[key] = (s / max(K, 1), mod.weight.numel())
     if not info:
         return {}
     keys = list(info)
     w = torch.tensor([info[k][0] for k in keys], dtype=torch.float64)
     numel = torch.tensor([float(info[k][1]) for k in keys], dtype=torch.float64)
-    budget = target_sp * float(numel.sum)
+    budget = target_sp * float(numel.sum())
 
     def used(lam):
         sp = (1.0 - w / (lam * numel)).clamp(sp_min, sp_max)
-        return sp, float((sp * numel).sum)
+        return sp, float((sp * numel).sum())
 
     lo, hi = 1e-30, 1e30
     for _ in range(200):
@@ -793,32 +809,32 @@ def _compute_fint_inmemory(model, calibration_data, device, tok_cap=512):
     def mk(k):
         def h(mod, inp, out):
             o = out[0] if isinstance(out, tuple) else out
-            o.retain_grad; caps[k] = o
-            cap_in[k] = (inp[0] if isinstance(inp, tuple) else inp).detach
+            o.retain_grad(); caps[k] = o
+            cap_in[k] = (inp[0] if isinstance(inp, tuple) else inp).detach()
         return h
-    for k, mod in targets.items:
+    for k, mod in targets.items():
         hooks.append(mod.register_forward_hook(mk(k)))
     fint = {k: None for k in targets}
     data = calibration_data
     n_rows = data.shape[0]
     for i in tqdm(range(n_rows), desc="fint"):
         batch = data[i:i + 1].to(device)
-        model.zero_grad(set_to_none=True); caps.clear; cap_in.clear
+        model.zero_grad(set_to_none=True); caps.clear(); cap_in.clear()
         out = model(batch, labels=batch)
-        out.loss.backward
-        for k, o in caps.items:
+        out.loss.backward()
+        for k, o in caps.items():
             if o.grad is None:
                 continue
-            g = o.grad.reshape(-1, o.grad.shape[-1]).float
-            x = cap_in[k].reshape(-1, cap_in[k].shape[-1]).float
+            g = o.grad.reshape(-1, o.grad.shape[-1]).float()
+            x = cap_in[k].reshape(-1, cap_in[k].shape[-1]).float()
             m = min(g.shape[0], tok_cap)
-            fi = ((g[:m] ** 2).t @ (x[:m] ** 2) / m).cpu
+            fi = ((g[:m] ** 2).t() @ (x[:m] ** 2) / m).cpu()
             fint[k] = fi if fint[k] is None else fint[k] + fi
     for hk in hooks:
-        hk.remove
+        hk.remove()
     model.zero_grad(set_to_none=True)
-    torch.cuda.empty_cache
-    return {k: (v / n_rows) for k, v in fint.items if v is not None}
+    torch.cuda.empty_cache()
+    return {k: (v / n_rows) for k, v in fint.items() if v is not None}
 
 
 def apply_wanda_obs_rtn(model, calibration_data, nbits, sparsity_by_type, device='cuda',
@@ -827,7 +843,7 @@ def apply_wanda_obs_rtn(model, calibration_data, nbits, sparsity_by_type, device
                         sens_fair=False, fisher_shrink=1.0, col_balance_exp=1.0, balance_per_row=False,
                         group_size=None, no_obs=False, quantizer='rtn', margin_log=None,
                         margin_ctx=None, sparsity_by_matrix=None, rank_combine='sum', rank_magw=1e-3,
-                        robust_calib=None, floor_frac=0.0):
+                        robust_calib=None, floor_frac=0.0, obs_damp=None, mask_block=0):
     """Quantize every target linear with {Wanda|inverse-μ}-mask + OBS + group-RTN,
     using per-type sparsity. mask_mode='wanda' is the deliverable path (non-Sinkhorn);
     mask_mode='inverse_mu' is DIAGNOSTIC (Sinkhorn μ in the mask only) for the
@@ -861,16 +877,16 @@ def apply_wanda_obs_rtn(model, calibration_data, nbits, sparsity_by_type, device
         # generalization (col-||X|| rank-corr across dists is only ~0.55-0.65; mask overfits calib).
         rob_acts = bs.collect_activations(model, robust_calib, device)
         robust_norm = {}
-        for k, xw in layer_activations.items:
+        for k, xw in layer_activations.items():
             xr = rob_acts.get(k)
             if xr is None:
                 continue
             def cn(x):
-                x = x.float
-                if x.dim == 3:
+                x = x.float()
+                if x.dim() == 3:
                     x = x.reshape(-1, x.shape[-1])
                 return torch.norm(x[:min(x.shape[0], 256)].to(device), dim=0)
-            robust_norm[k] = torch.minimum(cn(xw), cn(xr)).cpu
+            robust_norm[k] = torch.minimum(cn(xw), cn(xr)).cpu()
         del rob_acts
     # collect_activations moves every transformer layer to `device` and never offloads,
     # leaving the WHOLE fp16 model resident on GPU throughout the OBS build (peak ~= model
@@ -879,7 +895,7 @@ def apply_wanda_obs_rtn(model, calibration_data, nbits, sparsity_by_type, device
     # below brings them up one at a time (numerically identical, memory-only change).
     for _l in get_layers(model):
         _l.to("cpu")
-    torch.cuda.empty_cache
+    torch.cuda.empty_cache()
     layer_paths = bs.get_layer_paths(model)
     _nheads = getattr(getattr(model, 'config', None), 'num_attention_heads', None)
     sens_cache = _load_sensitivity(sens_file) if mask_mode == 'sens_wanda' else None
@@ -904,14 +920,14 @@ def apply_wanda_obs_rtn(model, calibration_data, nbits, sparsity_by_type, device
                 sp = sparsity_by_matrix[act_key0]        # global-sensitivity allocation (per-matrix)
             else:
                 sp = sparsity_by_type.get(t, 0.70)
-            W = linear.weight.data.clone
-            bias = linear.bias.data.clone if linear.bias is not None else None
+            W = linear.weight.data.clone()
+            bias = linear.bias.data.clone() if linear.bias is not None else None
             act_key = f'layer_{layer_idx}.{attr_path}'
             acts = layer_activations.get(act_key, None)
             act_abs = None
             if acts is None:
                 # no activations -> cannot OBS; fall back to dense quant of W
-                W_comp, mask = W.float.to(device), torch.ones_like(W, device=device).float
+                W_comp, mask = W.float().to(device), torch.ones_like(W, device=device).float()
             else:
                 acts_d = acts.to(device)
                 if mask_mode == 'inverse_mu':
@@ -921,7 +937,8 @@ def apply_wanda_obs_rtn(model, calibration_data, nbits, sparsity_by_type, device
                 elif mask_mode == 'inverse_dual':
                     W_comp, mask = dual_mask_and_obs(W, acts_d, sp, device, scope=mask_scope)
                 elif mask_mode == 'obs_saliency':
-                    W_comp, mask = obs_saliency_mask_and_obs(W, acts_d, sp, device, scope=mask_scope)
+                    W_comp, mask = obs_saliency_mask_and_obs(W, acts_d, sp, device, scope=mask_scope,
+                                                            damp_frac=obs_damp)
                 elif mask_mode == 'sens_wanda':
                     sens_row = sens_cache.get(act_key) if sens_cache is not None else None
                     W_comp, mask = sens_wanda_mask_and_obs(W, acts_d, sp, device, scope=mask_scope,
@@ -929,25 +946,26 @@ def apply_wanda_obs_rtn(model, calibration_data, nbits, sparsity_by_type, device
                                                            fair=sens_fair)
                 elif mask_mode == 'balanced':
                     W_comp, mask = balanced_mask_and_obs(W, acts_d, sp, device, col_exp=col_balance_exp,
-                                                         per_row_thresh=balance_per_row, no_obs=no_obs)
+                                                         per_row_thresh=balance_per_row, no_obs=no_obs,
+                                                         mask_block=mask_block)
                 elif mask_mode == 'balanced_cond':
                     # NON-SEPARABLE conditioning-modulated balance (#28): the column-balance SUPPRESSION
                     # exponent is modulated PER-COLUMN by uniqueness u_j=1/[H^-1]_jj -- well-conditioned
                     # (unique/spanning) columns get LESS suppression (protected, kept more), redundant
                     # columns MORE. Couples balance STRENGTH to conditioning (wanda has no balance => cannot
                     # express => CoBALT-specific). One-shot, global. gamma=0.5 modulation depth.
-                    Wd = W.float.to(device)
-                    Xh = acts_d.float
-                    if Xh.dim == 3:
+                    Wd = W.float().to(device)
+                    Xh = acts_d.float()
+                    if Xh.dim() == 3:
                         Xh = Xh.reshape(-1, Xh.shape[-1])
                     Xh = Xh[:min(Xh.shape[0], 256)]
                     Kc, Nc = Wd.shape
-                    H_inv = compute_hessian_inverse(Xh, damping=None); H_inv_diag = H_inv.diag
+                    H_inv = compute_hessian_inverse(Xh, damping=None); H_inv_diag = H_inv.diag()
                     u = (1.0 / (H_inv_diag + 1e-12)).clamp(min=0)
-                    u = (u / (u.mean + 1e-12))                         # normalized uniqueness [N]
+                    u = (u / (u.mean() + 1e-12))                         # normalized uniqueness [N]
                     b = col_balance_exp; gamma = 0.5
                     beta_j = (b * (1.0 - gamma * (u - 1.0))).clamp(min=0.0, max=2.0 * b).view(1, -1)
-                    imp = Wd.abs * torch.norm(Xh, dim=0).view(1, -1)
+                    imp = Wd.abs() * torch.norm(Xh, dim=0).view(1, -1)
                     kr, kc = int(Nc * sp), int(Kc * sp)
                     if kr > 0:
                         imp = imp / torch.kthvalue(imp, kr, dim=1, keepdim=True).values.clamp(min=1e-30)
@@ -965,13 +983,13 @@ def apply_wanda_obs_rtn(model, calibration_data, nbits, sparsity_by_type, device
                     # per-HEAD-block balance term (global balance leaves per-head keep-rate CV 0.21-0.24,
                     # MEASURED). Each attention head's o_proj input block competes fairly => proportional
                     # head contribution. Other matrices = standard balanced (no input-head structure).
-                    Wd = W.float.to(device)
-                    Xh = acts_d.float
-                    if Xh.dim == 3:
+                    Wd = W.float().to(device)
+                    Xh = acts_d.float()
+                    if Xh.dim() == 3:
                         Xh = Xh.reshape(-1, Xh.shape[-1])
                     Xh = Xh[:min(Xh.shape[0], 256)]
                     Kh, Nh = Wd.shape
-                    imp = Wd.abs * torch.norm(Xh, dim=0).view(1, -1)
+                    imp = Wd.abs() * torch.norm(Xh, dim=0).view(1, -1)
                     kr, kc = int(Nh * sp), int(Kh * sp)
                     if kr > 0:
                         imp = imp / torch.kthvalue(imp, kr, dim=1, keepdim=True).values.clamp(min=1e-30)
@@ -988,7 +1006,7 @@ def apply_wanda_obs_rtn(model, calibration_data, nbits, sparsity_by_type, device
                     if no_obs:
                         W_comp = Wd * mask
                     else:
-                        H_inv = compute_hessian_inverse(Xh, damping=None); H_inv_diag = H_inv.diag
+                        H_inv = compute_hessian_inverse(Xh, damping=None); H_inv_diag = H_inv.diag()
                         P = (Wd * (1.0 - mask)) / H_inv_diag.view(1, -1)
                         W_comp = (Wd - P @ H_inv) * mask
                 elif mask_mode == 'wanda_span':
@@ -996,15 +1014,15 @@ def apply_wanda_obs_rtn(model, calibration_data, nbits, sparsity_by_type, device
                     # weight to plain per-row WANDA (NO column balance). If wanda_span improves wanda as
                     # much as balanced_span improves cobalt, spanning is a UNIVERSAL lever (not CoBALT-
                     # specific) => the awclip trap. Isolates spanning from column balance.
-                    Wd = W.float.to(device)
-                    Xs = acts_d.float
-                    if Xs.dim == 3:
+                    Wd = W.float().to(device)
+                    Xs = acts_d.float()
+                    if Xs.dim() == 3:
                         Xs = Xs.reshape(-1, Xs.shape[-1])
                     Xs = Xs[:min(Xs.shape[0], 256)]
-                    H_inv = compute_hessian_inverse(Xs, damping=None); H_inv_diag = H_inv.diag
+                    H_inv = compute_hessian_inverse(Xs, damping=None); H_inv_diag = H_inv.diag()
                     uniq = (1.0 / (H_inv_diag + 1e-12)).clamp(min=0)
-                    uniq = (uniq / (uniq.mean + 1e-12)).pow(0.5).view(1, -1)
-                    imp = Wd.abs * torch.norm(Xs, dim=0).view(1, -1) * uniq
+                    uniq = (uniq / (uniq.mean() + 1e-12)).pow(0.5).view(1, -1)
+                    imp = Wd.abs() * torch.norm(Xs, dim=0).view(1, -1) * uniq
                     mask = _threshold_mask(imp, sp, scope='per_row')
                     if no_obs:
                         W_comp = Wd * mask
@@ -1017,26 +1035,26 @@ def apply_wanda_obs_rtn(model, calibration_data, nbits, sparsity_by_type, device
                     # A = W*||X|| -> keep entries carrying the top singular SUBSPACE (preserve the layer's
                     # dominant output directions), NOT per-entry magnitude. specblend = geometric blend with
                     # the magnitude importance (guard against discarding individually-salient weights).
-                    Wd = W.float.to(device)
-                    Xsp = acts_d.float
-                    if Xsp.dim == 3:
+                    Wd = W.float().to(device)
+                    Xsp = acts_d.float()
+                    if Xsp.dim() == 3:
                         Xsp = Xsp.reshape(-1, Xsp.shape[-1])
                     Xsp = Xsp[:min(Xsp.shape[0], 256)]
                     cnorm = torch.norm(Xsp, dim=0)
                     A = Wd * cnorm.view(1, -1)
                     kk = min(32, min(A.shape) - 1)
                     U, Sv, Vh = torch.svd_lowrank(A, q=kk)
-                    Ak = (U * Sv.unsqueeze(0)) @ Vh.t
-                    imp_mag = Wd.abs * cnorm.view(1, -1)
+                    Ak = (U * Sv.unsqueeze(0)) @ Vh.t()
+                    imp_mag = Wd.abs() * cnorm.view(1, -1)
                     if mask_mode == 'balanced_specblend':
-                        imp = imp_mag.clamp(min=1e-30).pow(0.5) * Ak.abs.clamp(min=1e-30).pow(0.5)
+                        imp = imp_mag.clamp(min=1e-30).pow(0.5) * Ak.abs().clamp(min=1e-30).pow(0.5)
                     else:
-                        imp = Ak.abs
+                        imp = Ak.abs()
                     mask = balanced_keepmask_local(imp, sp, col_balance_exp)
                     if no_obs:
                         W_comp = Wd * mask
                     else:
-                        H_inv = compute_hessian_inverse(Xsp, damping=None); H_inv_diag = H_inv.diag
+                        H_inv = compute_hessian_inverse(Xsp, damping=None); H_inv_diag = H_inv.diag()
                         P = (Wd * (1.0 - mask)) / H_inv_diag.view(1, -1)
                         W_comp = (Wd - P @ H_inv) * mask
                 elif mask_mode == 'balanced_span':
@@ -1044,15 +1062,15 @@ def apply_wanda_obs_rtn(model, calibration_data, nbits, sparsity_by_type, device
                     # the column importance up-weighted by UNIQUE variance (1/[H^-1]_jj)^0.5 -> keep a
                     # well-conditioned, SPANNING survivor set (better OBS reconstruction off-distribution).
                     # Screen-top candidate; one-shot, global, non-grid. H_inv reused for the weight+OBS.
-                    Wd = W.float.to(device)
-                    Xs = acts_d.float
-                    if Xs.dim == 3:
+                    Wd = W.float().to(device)
+                    Xs = acts_d.float()
+                    if Xs.dim() == 3:
                         Xs = Xs.reshape(-1, Xs.shape[-1])
                     Xs = Xs[:min(Xs.shape[0], 256)]
-                    H_inv = compute_hessian_inverse(Xs, damping=None); H_inv_diag = H_inv.diag
+                    H_inv = compute_hessian_inverse(Xs, damping=None); H_inv_diag = H_inv.diag()
                     uniq = (1.0 / (H_inv_diag + 1e-12)).clamp(min=0)
-                    uniq = (uniq / (uniq.mean + 1e-12)).pow(0.5).view(1, -1)
-                    imp = Wd.abs * torch.norm(Xs, dim=0).view(1, -1) * uniq
+                    uniq = (uniq / (uniq.mean() + 1e-12)).pow(0.5).view(1, -1)
+                    imp = Wd.abs() * torch.norm(Xs, dim=0).view(1, -1) * uniq
                     mask = balanced_keepmask_local(imp, sp, col_balance_exp)
                     if no_obs:
                         W_comp = Wd * mask
@@ -1062,17 +1080,17 @@ def apply_wanda_obs_rtn(model, calibration_data, nbits, sparsity_by_type, device
                 elif mask_mode == 'balanced_exact':
                     # EXACT doubly-degree-balanced support (#18): HARD column balance (CV ~4x < soft-beta)
                     # retaining magnitude info. Sharpens the collapse-rescue mechanism to its hard form.
-                    Wd = W.float.to(device)
-                    Xe = acts_d.float
-                    if Xe.dim == 3:
+                    Wd = W.float().to(device)
+                    Xe = acts_d.float()
+                    if Xe.dim() == 3:
                         Xe = Xe.reshape(-1, Xe.shape[-1])
                     Xe = Xe[:min(Xe.shape[0], 256)]
-                    imp = Wd.abs * torch.norm(Xe, dim=0).view(1, -1)
+                    imp = Wd.abs() * torch.norm(Xe, dim=0).view(1, -1)
                     mask = exact_doubly_balanced_mask(imp, sp)
                     if no_obs:
                         W_comp = Wd * mask
                     else:
-                        H_inv = compute_hessian_inverse(Xe, damping=None); H_inv_diag = H_inv.diag
+                        H_inv = compute_hessian_inverse(Xe, damping=None); H_inv_diag = H_inv.diag()
                         P = (Wd * (1.0 - mask)) / H_inv_diag.view(1, -1)
                         W_comp = (Wd - P @ H_inv) * mask
                 elif mask_mode in ('balanced_floor', 'wanda_floor'):
@@ -1081,13 +1099,13 @@ def apply_wanda_obs_rtn(model, calibration_data, nbits, sparsity_by_type, device
                     # EXACTLY constant. Rescues the OBS-uncompensable DEAD columns the soft mask leaves
                     # (MEASURED 0.1-2% at sp0.7, src/probe_colfloor.py). 'wanda_floor' = the S4 attribution
                     # control (same floor on wanda's per-row importance) to test if the floor is universal.
-                    Wd = W.float.to(device)
-                    Xf = acts_d.float
-                    if Xf.dim == 3:
+                    Wd = W.float().to(device)
+                    Xf = acts_d.float()
+                    if Xf.dim() == 3:
                         Xf = Xf.reshape(-1, Xf.shape[-1])
                     Xf = Xf[:min(Xf.shape[0], 256)]
                     Kf, Nf = Wd.shape
-                    imp = Wd.abs * torch.norm(Xf, dim=0).view(1, -1)   # Wanda base importance
+                    imp = Wd.abs() * torch.norm(Xf, dim=0).view(1, -1)   # Wanda base importance
                     if mask_mode == 'balanced_floor':
                         # replicate CoBALT's row+col quantile self-normalization for BOTH the base mask
                         # and the floor ranking, so the rescue respects column balance too.
@@ -1103,7 +1121,7 @@ def apply_wanda_obs_rtn(model, calibration_data, nbits, sparsity_by_type, device
                     if no_obs:
                         W_comp = Wd * mask
                     else:
-                        H_inv = compute_hessian_inverse(Xf, damping=None); H_inv_diag = H_inv.diag
+                        H_inv = compute_hessian_inverse(Xf, damping=None); H_inv_diag = H_inv.diag()
                         P = (Wd * (1.0 - mask)) / H_inv_diag.view(1, -1)
                         W_comp = (Wd - P @ H_inv) * mask
                 elif mask_mode == 'balanced_rank':
@@ -1114,16 +1132,16 @@ def apply_wanda_obs_rtn(model, calibration_data, nbits, sparsity_by_type, device
                     # are important BOTH within their row AND their column => intrinsically balanced along
                     # both axes without a global-scale artifact, and it is INVARIANT to per-row/col scale
                     # (so no starvation). Different STRUCTURE, not a new importance signal (which degraded).
-                    Wd = W.float.to(device)
-                    Xr = acts_d.float
-                    if Xr.dim == 3:
+                    Wd = W.float().to(device)
+                    Xr = acts_d.float()
+                    if Xr.dim() == 3:
                         Xr = Xr.reshape(-1, Xr.shape[-1])
                     Xr = Xr[:min(Xr.shape[0], 256)]
-                    imp = Wd.abs * torch.norm(Xr, dim=0).view(1, -1)
+                    imp = Wd.abs() * torch.norm(Xr, dim=0).view(1, -1)
                     Kr, Nr = imp.shape
                     # percentile rank within each row and within each column (argsort-argsort / size)
-                    rrank = imp.argsort(dim=1).argsort(dim=1).float / max(Nr - 1, 1)   # [K,N] in [0,1]
-                    crank = imp.argsort(dim=0).argsort(dim=0).float / max(Kr - 1, 1)
+                    rrank = imp.argsort(dim=1).argsort(dim=1).float() / max(Nr - 1, 1)   # [K,N] in [0,1]
+                    crank = imp.argsort(dim=0).argsort(dim=0).float() / max(Kr - 1, 1)
                     b = col_balance_exp
                     if rank_combine == 'min':      # keep entries high-rank in BOTH axes (selective)
                         score = torch.minimum(rrank, b * crank if b > 0 else rrank)
@@ -1133,34 +1151,34 @@ def apply_wanda_obs_rtn(model, calibration_data, nbits, sparsity_by_type, device
                         # controls the blend: small=pure rank; large=magnitude/base-like). Fixes the qwen
                         # collapse where rank alone discards the |W|.||X|| magnitude info.
                         flat = imp.reshape(-1)
-                        imp_pr = (flat.argsort.argsort.float / max(Kr * Nr - 1, 1)).view(Kr, Nr)
+                        imp_pr = (flat.argsort().argsort().float() / max(Kr * Nr - 1, 1)).view(Kr, Nr)
                         score = rrank + b * crank + rank_magw * (1.0 + b) * imp_pr
                     else:                          # 'sum' (default)
                         score = rrank + b * crank
                     n_keep = int(Kr * Nr * (1.0 - sp))
                     thr = torch.kthvalue(score.view(-1), max(Kr * Nr - n_keep, 1)).values
-                    mask = (score.view(-1) > thr).view(Kr, Nr).float
+                    mask = (score.view(-1) > thr).view(Kr, Nr).float()
                     if no_obs:
                         W_comp = Wd * mask
                     else:
-                        H_inv = compute_hessian_inverse(Xr, damping=None); H_inv_diag = H_inv.diag
+                        H_inv = compute_hessian_inverse(Xr, damping=None); H_inv_diag = H_inv.diag()
                         P = (Wd * (1.0 - mask)) / H_inv_diag.view(1, -1)
                         W_comp = (Wd - P @ H_inv) * mask
                 elif mask_mode == 'balanced_stoch':
                     # STOCHASTIC HELD-OUT selection (#14): generate K importance-perturbed balanced masks,
                     # keep the one with lowest HELD-OUT (ptb) reconstruction error. Selects the survivor set
                     # that GENERALIZES best (not the calib-certificate min, which mispredicts downstream).
-                    Wd = W.float.to(device)
-                    Xw = acts_d.float
-                    if Xw.dim == 3:
+                    Wd = W.float().to(device)
+                    Xw = acts_d.float()
+                    if Xw.dim() == 3:
                         Xw = Xw.reshape(-1, Xw.shape[-1])
                     Xw = Xw[:min(Xw.shape[0], 256)]
                     Xp = ptb_acts.get(act_key) if ptb_acts is not None else None
-                    imp0 = Wd.abs * torch.norm(Xw, dim=0).view(1, -1)
-                    H_inv = compute_hessian_inverse(Xw, damping=None); H_inv_diag = H_inv.diag
+                    imp0 = Wd.abs() * torch.norm(Xw, dim=0).view(1, -1)
+                    H_inv = compute_hessian_inverse(Xw, damping=None); H_inv_diag = H_inv.diag()
                     if Xp is not None:
-                        Xp = Xp.float.to(device)
-                        if Xp.dim == 3:
+                        Xp = Xp.float().to(device)
+                        if Xp.dim() == 3:
                             Xp = Xp.reshape(-1, Xp.shape[-1])
                         Xp = Xp[:min(Xp.shape[0], 256)]
                     best = None; best_err = float('inf')
@@ -1176,9 +1194,9 @@ def apply_wanda_obs_rtn(model, calibration_data, nbits, sparsity_by_type, device
                         Wc = (Wd - P @ H_inv) * mk
                         D = Wc - Wd
                         if Xp is not None:
-                            err = float((Xp @ D.t).pow(2).sum)   # held-out ||X_ptb D^T||^2
+                            err = float((Xp @ D.t()).pow(2).sum())   # held-out ||X_ptb D^T||^2
                         else:
-                            err = float((Xw @ D.t).pow(2).sum)
+                            err = float((Xw @ D.t()).pow(2).sum())
                         if err < best_err:
                             best_err, best, best_mk = err, Wc, mk
                     W_comp, mask = (best if not no_obs else Wd * best_mk), best_mk
@@ -1187,17 +1205,17 @@ def apply_wanda_obs_rtn(model, calibration_data, nbits, sparsity_by_type, device
                     # REDUNDANT (predictable from others) so the survivor set is more DECORRELATED/spanning.
                     # redundancy_j = mean_k |corr(X_j, X_k)| (from the activation Gram); keep low-redundancy
                     # (independent) channels. importance = |W|.||X||.(1 - redundancy). One-shot, non-iterative.
-                    Wd = W.float.to(device)
-                    Xc = acts_d.float
-                    if Xc.dim == 3:
+                    Wd = W.float().to(device)
+                    Xc = acts_d.float()
+                    if Xc.dim() == 3:
                         Xc = Xc.reshape(-1, Xc.shape[-1])
                     Xc = Xc[:min(Xc.shape[0], 256)]
-                    G = Xc.t @ Xc
-                    d = G.diagonal.clamp(min=1e-12).sqrt
-                    corr = (G / d.view(-1, 1) / d.view(1, -1)).abs
+                    G = Xc.t() @ Xc
+                    d = G.diagonal().clamp(min=1e-12).sqrt()
+                    corr = (G / d.view(-1, 1) / d.view(1, -1)).abs()
                     redund = (corr.mean(1) - 1.0 / corr.shape[0]).clamp(0, 1)   # exclude self
                     xn = torch.norm(Xc, dim=0)
-                    imp_base = Wd.abs * xn.view(1, -1) * (1.0 - redund).clamp(min=1e-3).view(1, -1)
+                    imp_base = Wd.abs() * xn.view(1, -1) * (1.0 - redund).clamp(min=1e-3).view(1, -1)
                     W_comp, mask = balanced_mask_and_obs(W, acts_d, sp, device, col_exp=col_balance_exp,
                                                          no_obs=no_obs, imp_base=imp_base)
                 elif mask_mode == 'balanced_outlier':
@@ -1206,23 +1224,23 @@ def apply_wanda_obs_rtn(model, calibration_data, nbits, sparsity_by_type, device
                     # cols). Protect the top outlier channels (by max|X|/median peakiness) from the column
                     # balancing so their critical pathways survive, balance the rest. col_balance_exp still
                     # sets balance strength; rank_magw REUSED as the outlier fraction (top-f cols exempt).
-                    Wd = W.float.to(device)
-                    Xo = acts_d.float
-                    if Xo.dim == 3:
+                    Wd = W.float().to(device)
+                    Xo = acts_d.float()
+                    if Xo.dim() == 3:
                         Xo = Xo.reshape(-1, Xo.shape[-1])
                     Xo = Xo[:min(Xo.shape[0], 256)]
                     xn = torch.norm(Xo, dim=0)
-                    pe0 = Xo.abs.amax(0) / Xo.abs.median(0).values.clamp(min=1e-8)  # per-col peakiness
+                    pe0 = Xo.abs().amax(0) / Xo.abs().median(0).values.clamp(min=1e-8)  # per-col peakiness
                     f = rank_magw if 0 < rank_magw < 0.5 else 0.02
                     thr_o = torch.quantile(pe0, 1.0 - f)
                     boost = torch.where(pe0 >= thr_o, torch.full_like(xn, 4.0), torch.ones_like(xn))
-                    imp_base = Wd.abs * xn.view(1, -1) * boost.view(1, -1)   # outlier cols boosted 4x
+                    imp_base = Wd.abs() * xn.view(1, -1) * boost.view(1, -1)   # outlier cols boosted 4x
                     W_comp, mask = balanced_mask_and_obs(W, acts_d, sp, device, col_exp=col_balance_exp,
                                                          no_obs=no_obs, imp_base=imp_base)
                 elif mask_mode == 'balanced_robust':
-                    Wd = W.float.to(device)
+                    Wd = W.float().to(device)
                     rn = robust_norm.get(act_key) if robust_norm is not None else None
-                    imp_base = (Wd.abs * rn.to(device).view(1, -1)) if rn is not None else None
+                    imp_base = (Wd.abs() * rn.to(device).view(1, -1)) if rn is not None else None
                     W_comp, mask = balanced_mask_and_obs(W, acts_d, sp, device, col_exp=col_balance_exp,
                                                          no_obs=no_obs, imp_base=imp_base)
                 elif mask_mode == 'balanced_obs':
@@ -1231,14 +1249,14 @@ def apply_wanda_obs_rtn(model, calibration_data, nbits, sparsity_by_type, device
                     # ignores cross-channel compensability. Feed |W|.sqrt(1/[H^-1]_jj) as the balanced
                     # importance (sqrt so it composes with the |W| like the energy form). Closes the
                     # 'which importance signal' axis with its theoretically-optimal member.
-                    Wd = W.float.to(device)
-                    Xo = acts_d.float
-                    if Xo.dim == 3:
+                    Wd = W.float().to(device)
+                    Xo = acts_d.float()
+                    if Xo.dim() == 3:
                         Xo = Xo.reshape(-1, Xo.shape[-1])
                     Xo = Xo[:min(Xo.shape[0], 256)]
                     Hinv0 = compute_hessian_inverse(Xo, damping=None)
-                    hjj = Hinv0.diag.clamp(min=1e-12)                 # [N] = [H^-1]_jj
-                    imp_base = Wd.abs * (1.0 / hjj).sqrt.view(1, -1)
+                    hjj = Hinv0.diag().clamp(min=1e-12)                 # [N] = [H^-1]_jj
+                    imp_base = Wd.abs() * (1.0 / hjj).sqrt().view(1, -1)
                     W_comp, mask = balanced_mask_and_obs(W, acts_d, sp, device, col_exp=col_balance_exp,
                                                          no_obs=no_obs, imp_base=imp_base)
                 elif mask_mode == 'balanced_lev':
@@ -1247,24 +1265,24 @@ def apply_wanda_obs_rtn(model, calibration_data, nbits, sparsity_by_type, device
                     # High leverage = independent/unique channel = HARD to OBS-compensate if pruned => keep.
                     # Low leverage = redundant channel = cheaply compensated => prunable. One-shot (one solve),
                     # non-iterative. Replaces Wanda's marginal ||X|| energy with a conditioning signal.
-                    Wd = W.float.to(device)
-                    Xl = acts_d.float
-                    if Xl.dim == 3:
+                    Wd = W.float().to(device)
+                    Xl = acts_d.float()
+                    if Xl.dim() == 3:
                         Xl = Xl.reshape(-1, Xl.shape[-1])
                     Xl = Xl[:min(Xl.shape[0], 256)]
-                    G = Xl.t @ Xl
+                    G = Xl.t() @ Xl
                     Nn = G.shape[0]
-                    lam = 0.01 * (G.diagonal.mean.clamp(min=1e-8))
+                    lam = 0.01 * (G.diagonal().mean().clamp(min=1e-8))
                     Ginv = torch.linalg.inv(G + lam * torch.eye(Nn, device=device))
-                    lev = (G * Ginv.t).sum(1).clamp(min=0)          # diag(G Ginv) [N], in [0,1]
-                    imp_base = Wd.abs * lev.view(1, -1).sqrt
+                    lev = (G * Ginv.t()).sum(1).clamp(min=0)          # diag(G Ginv) [N], in [0,1]
+                    imp_base = Wd.abs() * lev.view(1, -1).sqrt()
                     W_comp, mask = balanced_mask_and_obs(W, acts_d, sp, device, col_exp=col_balance_exp,
                                                          no_obs=no_obs, imp_base=imp_base)
                 elif mask_mode == 'balanced_fint':
                     # interaction importance |W|.sqrt(E[g^2 x^2]) fed into the balanced thresholding
-                    Wd = W.float.to(device)
+                    Wd = W.float().to(device)
                     M = fint_cache.get(act_key) if fint_cache is not None else None
-                    imp_base = Wd.abs * M.to(device).float.clamp(min=0).sqrt if M is not None else None
+                    imp_base = Wd.abs() * M.to(device).float().clamp(min=0).sqrt() if M is not None else None
                     W_comp, mask = balanced_mask_and_obs(W, acts_d, sp, device, col_exp=col_balance_exp,
                                                          no_obs=no_obs, imp_base=imp_base)
                 elif mask_mode == 'grid_balanced':
@@ -1279,10 +1297,10 @@ def apply_wanda_obs_rtn(model, calibration_data, nbits, sparsity_by_type, device
                 else:
                     W_comp, mask = wanda_mask_and_obs(W, acts_d, sp, device, scope=mask_scope,
                                                       act_exp=wanda_act_exp)
-                Xa = acts_d.float
-                if Xa.dim == 3:
+                Xa = acts_d.float()
+                if Xa.dim() == 3:
                     Xa = Xa.reshape(-1, Xa.shape[-1])
-                act_abs = Xa[:min(Xa.shape[0], 256)].abs.mean(0)   # [N] mean|X| per channel
+                act_abs = Xa[:min(Xa.shape[0], 256)].abs().mean(0)   # [N] mean|X| per channel
             K, N = W_comp.shape
             # Per-col (μ1 analog) + per-row scaling, then group-RTN on normalized W.
             # Dense matrices (sp==0, e.g. v-dense v_proj) use dense_norm so they are
@@ -1292,7 +1310,7 @@ def apply_wanda_obs_rtn(model, calibration_data, nbits, sparsity_by_type, device
             W_norm = W_comp / (r.view(-1, 1) * c.view(1, -1))
             q, scales, zeros, _ = quantize_rtn(W_norm, [0, 2 ** nbits - 1], group_size=gsize)
             # Fold per-row r into the (already-stored) group scales — no extra overhead.
-            if scales.dim == 3:
+            if scales.dim() == 3:
                 scales = scales * r.view(-1, 1, 1)
             else:
                 scales = scales * r.view(-1, 1)
@@ -1304,13 +1322,13 @@ def apply_wanda_obs_rtn(model, calibration_data, nbits, sparsity_by_type, device
                 # math4 arms: same mask/OBS/norm, only the survivor quantization
                 # differs, at strictly equal total bits (bitmap included).
                 import eout_quant as eq
-                W_best, info = eq.eout_requantize(W_comp.float, mask, Xa, nbits, gsize,
-                                                  r, c, q, scales.float, zeros.float,
+                W_best, info = eq.eout_requantize(W_comp.float(), mask, Xa, nbits, gsize,
+                                                  r, c, q, scales.float(), zeros.float(),
                                                   arm=quantizer)
                 lin = torch.nn.Linear(N, K, bias=bias is not None)
-                lin.weight.data = W_best.half
+                lin.weight.data = W_best.half()
                 if bias is not None:
-                    lin.bias.data = bias.half
+                    lin.bias.data = bias.half()
                 lin = lin.to(device)
                 setattr(parent, parts[-1], lin)
                 if margin_log is not None:
@@ -1324,26 +1342,26 @@ def apply_wanda_obs_rtn(model, calibration_data, nbits, sparsity_by_type, device
                         "e_rtn": info["e_rtn"], "e_repack": info.get("e_repack"),
                         "e_arm": info["e_arm"], "picked": info.get("picked"),
                         "rel_vs_rtn": info["e_arm"] / e0})
-                stats.append((t, W.numel, sp))
+                stats.append((t, W.numel(), sp))
                 del W, linear, W_comp, mask, q, scales, zeros, W_best
                 if acts is not None:
                     del acts
-                torch.cuda.empty_cache
+                torch.cuda.empty_cache()
                 continue
             meta = {'sparsity': sp, 'nbits': nbits, 'requested_nbits': nbits,
                     'group_size': gsize, 'shape': (K, N), 'method': f'wanda_obs_rtn_{norm}'}
-            new_layer = bs.SparseQuantLinear(q.half, scales.half, zeros.half,
-                                             mask.half, scale2.half, bias, meta)
+            new_layer = bs.SparseQuantLinear(q.half(), scales.half(), zeros.half(),
+                                             mask.half(), scale2.half(), bias, meta)
             new_layer = new_layer.to(device)
             setattr(parent, parts[-1], new_layer)
-            stats.append((t, W.numel, sp))
+            stats.append((t, W.numel(), sp))
             del W, linear, W_comp, mask, q, scales, zeros
             if acts is not None:
                 del acts
-            torch.cuda.empty_cache
+            torch.cuda.empty_cache()
         set_layer(model, layer_idx, layer)
-        gc.collect
-        torch.cuda.empty_cache
+        gc.collect()
+        torch.cuda.empty_cache()
     return model, stats
 
 
@@ -1371,8 +1389,8 @@ def param_fractions(model):
                     break
                 m = getattr(m, p)
             if ok and isinstance(m, nn.Linear):
-                counts[type_of(attr_path)] += m.weight.numel
-    tot = sum(counts.values)
+                counts[type_of(attr_path)] += m.weight.numel()
+    tot = sum(counts.values())
     return counts, tot
 
 
@@ -1382,9 +1400,9 @@ def global_sparsity(stats):
     return pruned / tot if tot else 0.0
 
 
-def main:
+def main():
     global MODEL
-    ap = argparse.ArgumentParser
+    ap = argparse.ArgumentParser()
     ap.add_argument("--mode", default="uniform", choices=["uniform", "vdense"])
     ap.add_argument("--norm", default="none",
                     choices=["none", "col", "dual", "acol", "dacol", "sinkhorn", "sinkhorn_sa"],
@@ -1468,7 +1486,7 @@ def main:
                     help="magtie magnitude-blend weight: 0=pure doubly-rank; large=magnitude/base-like.")
     ap.add_argument("--sp-min", type=float, default=0.3, help="min per-matrix sparsity in the allocation.")
     ap.add_argument("--sp-max", type=float, default=0.7, help="max per-matrix sparsity in the allocation.")
-    args = ap.parse_args
+    args = ap.parse_args()
 
     MODEL = args.model
     device = "cuda"
@@ -1481,7 +1499,7 @@ def main:
                                   seq_len=bs.EVAL_CONFIG["calibration_seq_len"], dataset_key="wikitext2")
 
     torch.manual_seed(0)
-    if torch.cuda.is_available:
+    if torch.cuda.is_available():
         torch.cuda.manual_seed_all(0)
     model = AutoModelForCausalLM.from_pretrained(name, torch_dtype=torch.float16,
                                                  device_map="cpu", low_cpu_mem_usage=True)
@@ -1510,7 +1528,7 @@ def main:
             raise RuntimeError(f"sens_alloc: {sm_path} not found (run src/compute_loss_sens.py --models {MODEL})")
         sm = torch.load(sm_path, map_location="cpu")
         sp_by_matrix = allocate_sparsity(sm, model, args.target_global, sp_min=args.sp_min, sp_max=args.sp_max)
-        vals = list(sp_by_matrix.values)
+        vals = list(sp_by_matrix.values())
         print(f"[sens_alloc] {len(vals)} matrices sp in [{min(vals):.3f},{max(vals):.3f}] "
               f"mean={sum(vals)/len(vals):.4f} (target {args.target_global})", flush=True)
 
@@ -1525,7 +1543,7 @@ def main:
                                        sparsity_by_matrix=sp_by_matrix, rank_combine=args.rank_combine,
                                        rank_magw=args.rank_magw, robust_calib=robust_calib)
     bs.move_final_layers_to_device(model, device)
-    model.eval
+    model.eval()
     gsp = global_sparsity(stats)
     ppl = bs.evaluate_perplexity(model, test, device)
     print(f"RESULT method=wanda_obs_rtn mask={args.mask} scope={args.mask_scope} "
@@ -1550,7 +1568,7 @@ def main:
             model.seqlen = bs.EVAL_CONFIG["seq_len"]  # CRB evals read model.seqlen
             ds_dir = args.downstream_csv_dir or os.path.join(_ROOT, "results", "downstream_grid")
             ds_tasks = ("all" if args.downstream_tasks in (None, "all")
-                        else [t.strip for t in args.downstream_tasks.split(",")])
+                        else [t.strip() for t in args.downstream_tasks.split(",")])
             ds_cfg = {
                 "timestamp": None,
                 "model": MODEL,
@@ -1570,4 +1588,4 @@ def main:
 
 
 if __name__ == "__main__":
-    main
+    main()

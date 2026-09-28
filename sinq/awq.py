@@ -225,10 +225,15 @@ def compute_awq_scale(weights, activations, min_max, tile=128, num_alphas=20, nu
     activations = activations.to(weights.device).to(weights.dtype)
 
 
-    # Compute activation importance - ensure it matches weight dimensions
-    mu_tokens = activations.float().abs().mean([0,1])
+    # Compute activation importance - ensure it matches weight dimensions.
+    # Reduce over every leading (token/batch) axis and keep the input-channel axis:
+    # the calibration hook hands this a 2-D (tokens, in_features) tensor, and a fixed
+    # mean([0,1]) collapsed that to a SCALAR, which silently removed AWQ's per-channel
+    # activation awareness (the scale then came only from the weight-scale division).
+    acts2d = activations.float().reshape(-1, activations.shape[-1])
+    mu_tokens = acts2d.abs().mean(0)
     mu_weights = weights.float().abs().mean([0])
-    std_tokens = activations.float().std([0,1])
+    std_tokens = acts2d.std(0)
 
     best_scale = torch.ones_like(mu_tokens.view(-1))
     best_error = float('inf')

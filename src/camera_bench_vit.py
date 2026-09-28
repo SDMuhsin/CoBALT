@@ -23,6 +23,7 @@ sys.path.insert(0, os.path.join(_ROOT, "src"))
 sys.path.insert(0, _ROOT)
 import benchmark_suite as bs   # noqa: E402
 import nosink as ns            # noqa: E402
+import tuned_grids as tg      # noqa: E402
 from eval_vit_imagenet import load_val, stratified, decode, preprocess_all, evaluate  # noqa: E402
 
 DEV = "cuda"
@@ -140,7 +141,11 @@ def _cobalt_balanced_prune_mask(W, H, sparsity, col_exp=0.5):
 
 def build_model(model_id, method, sparsity, bits, cal, group_size,
                 col_balance_exp=0.5, percdamp=0.01, blocksize=128,
-                jsq_rho=2.1, jsq_clip_h=0.01):
+                jsq_rho=2.1, jsq_clip_h=0.01,
+                awq_num_betas=1, awq_use_weightscale=True, awq_l1=False,
+                sinq_order=16, sinq_stop=True,
+                slim_lora=True, slim_cap_bins=0, slim_sparse_cap=False,
+                wanda_act_exp=0.5, wanda_scope="row"):
     from transformers import AutoModelForImageClassification
     torch.manual_seed(0)
     if torch.cuda.is_available():
@@ -151,11 +156,18 @@ def build_model(model_id, method, sparsity, bits, cal, group_size,
     if method == "fp16":
         pass
     elif method == "awq":
-        model = bs.apply_awq_quantization(model, cal, bits, DEV)
+        model = bs.apply_awq_quantization(model, cal, bits, DEV,
+                                          groupsize=group_size,
+                                          awq_num_betas=awq_num_betas,
+                                          awq_use_weightscale=awq_use_weightscale,
+                                          awq_l1=awq_l1)
     elif method == "sinq":
-        model = bs.apply_sinq_quantization(model, cal, bits, DEV)
+        model = bs.apply_sinq_quantization(model, cal, bits, DEV,
+                                           sinq_order=sinq_order, sinq_stop=sinq_stop,
+                                           group_size=group_size)
     elif method == "wanda":
-        model = bs.apply_wanda_pruning(model, cal, float(sparsity), DEV)
+        model = bs.apply_wanda_pruning(model, cal, float(sparsity), DEV,
+                                       act_exp=wanda_act_exp, scope=wanda_scope)
     elif method == "sparsegpt":
         model = bs.apply_sparsegpt_pruning(model, cal, float(sparsity), bits, DEV,
                                            percdamp=float(percdamp), blocksize=int(blocksize))
@@ -167,11 +179,20 @@ def build_model(model_id, method, sparsity, bits, cal, group_size,
         os.environ["JSQ_CLIPH"] = f"{float(jsq_clip_h):g}"
         model = bs.apply_jsq_weightonly_quantization(model, cal, bits, float(sparsity), DEV)
     elif method == "slim":
-        model = bs.apply_slim_quantization(model, cal, bits, float(sparsity), DEV)
+        model = bs.apply_slim_quantization(model, cal, bits, float(sparsity), DEV,
+                                           slim_lora=slim_lora,
+                                           cap_bins=(slim_cap_bins or None),
+                                           sparse_aware_cap=slim_sparse_cap)
     elif method == "wanda-awq":
-        model = bs.apply_wanda_awq_quantization(model, cal, bits, float(sparsity), DEV)
+        model = bs.apply_wanda_awq_quantization(model, cal, bits, float(sparsity), DEV,
+                                                groupsize=group_size,
+                                                awq_num_betas=awq_num_betas,
+                                                awq_use_weightscale=awq_use_weightscale,
+                                                awq_l1=awq_l1)
     elif method == "wanda-sinq":
-        model = bs.apply_wanda_sinq_quantization(model, cal, bits, float(sparsity), DEV)
+        model = bs.apply_wanda_sinq_quantization(model, cal, bits, float(sparsity), DEV,
+                                                 sinq_order=sinq_order, sinq_stop=sinq_stop,
+                                                 group_size=group_size)
     elif method == "cobalt":
         model, _ = ns.apply_wanda_obs_rtn(model, cal, bits, sbt, DEV, norm="col",
                                           mask_mode="balanced", dense_norm="col",
@@ -244,6 +265,9 @@ def main():
     ap.add_argument("--sgpt-blocksizes", default="128", help="sparsegpt blocksize grid, comma-sep")
     ap.add_argument("--jsq-rhos", default="2.1", help="jsq-wo rho grid, comma-sep")
     ap.add_argument("--jsq-cliphs", default="0.01", help="jsq-wo clip_h grid, comma-sep")
+    ap.add_argument("--hp-only", default="",
+                    help="restrict every method's grid to this one canonical hp label "
+                         "(from src/tuned_grids.py); used to transfer a tuned config here")
     args = ap.parse_args()
 
     install_vit_compat()
@@ -256,18 +280,27 @@ def main():
     jsq_cliphs = [float(x) for x in args.jsq_cliphs.split(",") if x.strip()]
 
     def hp_variants(method):
-        """Expand a method into its (hp_label, build_model_kwargs) grid. Only bpw-preserving knobs
-        are swept; wanda-awq/wanda-sinq/slim and the decomp diagnostics have no exposed matched
-        knob (single 'default')."""
-        if method == "cobalt":
+        """Expand a method into its (hp_label, build_model_kwargs) grid.
+
+        The canonical grids come from src/tuned_grids.py, so every arm carries a grid at
+        least as large as CoBALT's and the labels match the decoder and GLUE suites. A grid
+        overridden on the command line replaces that arm's list."""
+        if args.hp_only:
+            v = [(lab, kw) for lab, kw in tg.variants(method) if lab == args.hp_only]
+            if not v:
+                raise SystemExit(f"hp label {args.hp_only!r} is not in the {method} grid")
+            return v
+        if method == "cobalt" and list(betas) != list(tg.BETAS):
             return [(f"beta={b:g}", {"col_balance_exp": b}) for b in betas]
-        if method == "sparsegpt":
+        if method == "sparsegpt" and (list(percdamps) != list(tg.PERCDAMPS)
+                                      or list(blocksizes) != list(tg.BLOCKSIZES)):
             return [(f"pd={pd:g},bs={blk}", {"percdamp": pd, "blocksize": blk})
                     for pd in percdamps for blk in blocksizes]
-        if method == "jsq-wo":
+        if method == "jsq-wo" and (jsq_rhos != list(tg.JSQ_RHOS)
+                                   or jsq_cliphs != list(tg.JSQ_CLIPHS)):
             return [(f"rho={r:g},clip={c:g}", {"jsq_rho": r, "jsq_clip_h": c})
                     for r in jsq_rhos for c in jsq_cliphs]
-        return [("default", {})]
+        return tg.variants(method)
 
     from transformers import AutoImageProcessor
     proc = AutoImageProcessor.from_pretrained(args.model, use_fast=True)

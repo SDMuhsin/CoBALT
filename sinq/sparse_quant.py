@@ -130,7 +130,8 @@ def sinkhorn_log_sparse_aware(
     return W_norm, mu1, mu2
 
 
-def compute_hessian_inverse(X: Tensor, damping: float = None) -> Tensor:
+def compute_hessian_inverse(X: Tensor, damping: float = None,
+                            damp_frac: float = None) -> Tensor:
     """
     Compute full Hessian inverse (X^T X + λI)^-1 for error compensation.
 
@@ -146,9 +147,16 @@ def compute_hessian_inverse(X: Tensor, damping: float = None) -> Tensor:
 
     # Adaptive damping based on Hessian diagonal
     if damping is None:
-        # Use 1% of mean diagonal as damping
-        damping = 0.01 * H.diag().mean().item()
-        damping = max(damping, 1e-2)  # Minimum damping
+        if damp_frac is None:
+            # Use 1% of mean diagonal as damping
+            damping = 0.01 * H.diag().mean().item()
+            damping = max(damping, 1e-2)  # Minimum damping
+        else:
+            # Explicit relative damping (bit-budget-free tuned knob; the OBS analog of
+            # SparseGPT's percdamp). The absolute 1e-2 floor above would swamp the small
+            # end of a sweep, so an explicit fraction gets only a numerical floor and is
+            # allowed to be infeasible -- exactly as SparseGPT's percdamp=1e-3 is.
+            damping = max(float(damp_frac) * H.diag().mean().item(), 1e-12)
 
     H = H + damping * torch.eye(N, device=X.device, dtype=X.dtype)
     H_inv = torch.linalg.inv(H)

@@ -26,6 +26,7 @@ sys.path.insert(0, os.path.join(_ROOT, "benchmarks"))
 sys.path.insert(0, os.path.join(_ROOT, "src"))
 import benchmark_suite as bs   # noqa: E402
 import nosink as ns            # noqa: E402
+import tuned_grids as tg      # noqa: E402
 
 DEV = "cuda"
 # UNION of per-family block-linear paths (mirrors camera_bench_vit): absent paths are skipped
@@ -197,7 +198,11 @@ def evaluate(model, tok, ds, task, device, batch_size=64, max_len=128):
 # ------------------------------------------------------------- build (compression)
 def build_model(model_id, method, sparsity, bits, cal, group_size,
                 col_balance_exp=0.5, percdamp=0.01, blocksize=128,
-                jsq_rho=2.1, jsq_clip_h=0.01):
+                jsq_rho=2.1, jsq_clip_h=0.01,
+                awq_num_betas=1, awq_use_weightscale=True, awq_l1=False,
+                sinq_order=16, sinq_stop=True,
+                slim_lora=True, slim_cap_bins=0, slim_sparse_cap=False,
+                wanda_act_exp=0.5, wanda_scope="row"):
     from transformers import AutoModelForSequenceClassification, AutoConfig
     torch.manual_seed(0)
     if torch.cuda.is_available():
@@ -212,18 +217,31 @@ def build_model(model_id, method, sparsity, bits, cal, group_size,
     if method == "fp16":
         pass
     elif method == "awq":
-        model = bs.apply_awq_quantization(model, cal, bits, DEV)
+        model = bs.apply_awq_quantization(model, cal, bits, DEV,
+                                          groupsize=group_size,
+                                          awq_num_betas=awq_num_betas,
+                                          awq_use_weightscale=awq_use_weightscale,
+                                          awq_l1=awq_l1)
     elif method == "sinq":
-        model = bs.apply_sinq_quantization(model, cal, bits, DEV)
+        model = bs.apply_sinq_quantization(model, cal, bits, DEV,
+                                           sinq_order=sinq_order, sinq_stop=sinq_stop,
+                                           group_size=group_size)
     elif method == "wanda":
-        model = bs.apply_wanda_pruning(model, cal, float(sparsity), DEV)
+        model = bs.apply_wanda_pruning(model, cal, float(sparsity), DEV,
+                                       act_exp=wanda_act_exp, scope=wanda_scope)
     elif method == "sparsegpt":
         model = bs.apply_sparsegpt_pruning(model, cal, float(sparsity), bits, DEV,
                                            percdamp=float(percdamp), blocksize=int(blocksize))
     elif method == "wanda-awq":
-        model = bs.apply_wanda_awq_quantization(model, cal, bits, float(sparsity), DEV)
+        model = bs.apply_wanda_awq_quantization(model, cal, bits, float(sparsity), DEV,
+                                                groupsize=group_size,
+                                                awq_num_betas=awq_num_betas,
+                                                awq_use_weightscale=awq_use_weightscale,
+                                                awq_l1=awq_l1)
     elif method == "wanda-sinq":
-        model = bs.apply_wanda_sinq_quantization(model, cal, bits, float(sparsity), DEV)
+        model = bs.apply_wanda_sinq_quantization(model, cal, bits, float(sparsity), DEV,
+                                                 sinq_order=sinq_order, sinq_stop=sinq_stop,
+                                                 group_size=group_size)
     elif method == "jsq-wo":
         # JSQ weight-only (bit-matched). Its two live encoder knobs (rho, clip_h) are read from
         # env by _apply_jsq; set them per-cell here. (alpha/smoothing are inert on encoders — the
@@ -284,6 +302,9 @@ def main():
     ap.add_argument("--model", default="FacebookAI/roberta-large-mnli")
     ap.add_argument("--task", default="mnli")
     ap.add_argument("--methods", default="cobalt,sparsegpt,wanda-awq,wanda-sinq")
+    ap.add_argument("--hp-only", default="",
+                    help="restrict every method's grid to this one canonical hp label "
+                         "(from src/tuned_grids.py); used to transfer a tuned config here")
     ap.add_argument("--sparsities", default="0.5")
     ap.add_argument("--bits", type=int, default=3)
     ap.add_argument("--group-size", type=int, default=128)
@@ -313,17 +334,27 @@ def main():
     jsq_cliphs = [float(x) for x in args.jsq_cliphs.split(",") if x.strip()]
 
     def hp_variants(method):
-        """Expand a method into its (hp_label, build_model_kwargs) grid. Only bpw-preserving
-        knobs are swept; wanda-awq/wanda-sinq have no exposed matched knob (single 'default')."""
-        if method == "cobalt":
+        """Expand a method into its (hp_label, build_model_kwargs) grid.
+
+        The canonical grids come from src/tuned_grids.py, so every arm carries a grid at
+        least as large as CoBALT's and the labels match the decoder and ViT suites. A grid
+        overridden on the command line replaces that arm's list."""
+        if args.hp_only:
+            v = [(lab, kw) for lab, kw in tg.variants(method) if lab == args.hp_only]
+            if not v:
+                raise SystemExit(f"hp label {args.hp_only!r} is not in the {method} grid")
+            return v
+        if method == "cobalt" and list(betas) != list(tg.BETAS):
             return [(f"beta={b:g}", {"col_balance_exp": b}) for b in betas]
-        if method == "sparsegpt":
+        if method == "sparsegpt" and (list(percdamps) != list(tg.PERCDAMPS)
+                                      or list(blocksizes) != list(tg.BLOCKSIZES)):
             return [(f"pd={pd:g},bs={bs}", {"percdamp": pd, "blocksize": bs})
                     for pd in percdamps for bs in blocksizes]
-        if method == "jsq-wo":
+        if method == "jsq-wo" and (jsq_rhos != list(tg.JSQ_RHOS)
+                                   or jsq_cliphs != list(tg.JSQ_CLIPHS)):
             return [(f"rho={r:g},clip={c:g}", {"jsq_rho": r, "jsq_clip_h": c})
                     for r in jsq_rhos for c in jsq_cliphs]
-        return [("default", {})]
+        return tg.variants(method)
 
     cal = build_calibration(tok, args.task, args.n_calib, args.seq_len)
     eval_ds = load_eval(args.task)
