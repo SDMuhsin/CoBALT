@@ -106,6 +106,11 @@ __device__ __forceinline__ void warp_reduce(float* a) {
 #ifndef CBK_BLK1632_NOOVH
 #define CBK_BLK1632_NOOVH 0
 #endif
+// CBK_BLK1632_LOADONLY: DIAGNOSTIC -- stream the weights, skip the decode entirely (WRONG
+// RESULT).  The phase's memory floor: what a free decoder would leave.  Never ship.
+#ifndef CBK_BLK1632_LOADONLY
+#define CBK_BLK1632_LOADONLY 0
+#endif
 // CBK_BLK1632_BIAS: magic-bias byte->float.  See the patch_bias docstring.
 // Needs CBK_BLK1632_ZF (the bias is cancelled through the plain sum(x)).
 #ifndef CBK_BLK1632_BIAS
@@ -151,7 +156,23 @@ __device__ static const uint32_t prmt_lut[512] = {
 };
 #endif
 
-#if CBK_BLK1632_LUT == 2
+#if CBK_BLK1632_LUT == 4
+// LUT == 4: one uint4 per bitmap byte {sel0, sel1, mk0, mk1} in shared memory (4 KB): the pruned-slot
+// byte masks come from the table instead of the two 0x00204081 spreads + two 0xFF multiplies per
+// bitmap byte (6 ALU ops of the ~22 per expansion), and the two selector LDS.32 become one LDS.128.
+__device__ __noinline__ uint32_t* prmt_smem() { __shared__ __align__(16) uint32_t s[1024]; return s; }
+__device__ __forceinline__ void prmt_smem_stage() {
+  uint32_t* s = prmt_smem();
+  for (int b = threadIdx.x; b < 256; b += blockDim.x) {
+    const uint32_t sp0 = (((uint32_t)(b & 0xF) * 0x00204081u) & 0x01010101u);
+    const uint32_t sp1 = ((((uint32_t)(b >> 4) & 0xFu) * 0x00204081u) & 0x01010101u);
+    s[4 * b + 0] = prmt_lut[2 * b];
+    s[4 * b + 1] = prmt_lut[2 * b + 1];
+    s[4 * b + 2] = sp0 * 0xFFu;
+    s[4 * b + 3] = sp1 * 0xFFu;
+  }
+}
+#elif CBK_BLK1632_LUT == 2
 // One shared copy per BLOCK.  The array lives inside a __noinline__ accessor so that
 // exactly ONE allocation exists no matter how many times the decoder is inlined; the
 // megakernel stages it once at entry (prmt_smem_stage) where every thread is present.
@@ -585,12 +606,20 @@ __device__ __forceinline__ void gemv_dense4(const Mat& mt, int row,
 // The per-lane column ORDER is identical to gemv_dense4 (granule t = lane, lane+32, ...)
 // and scale/zero are applied per 32-column granule exactly as there, so a full-row call
 // is bit-identical to a full-row gemv_dense4 call.
-template<int M, int R, int NX, int PF>
+// CBK_SZPRE: load each granule's scale/zero in the PREDICATED prefetch stage together with the
+// weight granules instead of after the `break` in the compute loop (where they cannot be hoisted and
+// cost one dependent global-load latency per prefetch batch).  Same values, same arithmetic.
+#ifndef CBK_SZPRE
+#define CBK_SZPRE 0
+#endif
+// CS > 1: this warp handles only granules t with (t/32) % CS == cs (a COLUMN SLICE of every
+// row); the caller sums the CS warps' partial acc.  CS == 1, cs == 0 is the original walk.
+template<int M, int R, int NX, int PF, int CS = 1>
 __device__ __forceinline__ void gemv_dense4_multi(
     const uint8_t* __restrict__ data, size_t rstride,
     const __half* __restrict__ scale, const uint8_t* __restrict__ zero, int G, int N,
     const __nv_bfloat16* __restrict__ xa, const __nv_bfloat16* __restrict__ xb,
-    float acc[R][M]) {
+    float acc[R][M], int cs = 0) {
   const int lane = threadIdx.x & 31;
   const int NT = N >> 5;                       // 32-column granules
   #pragma unroll
@@ -598,20 +627,26 @@ __device__ __forceinline__ void gemv_dense4_multi(
     #pragma unroll
     for (int m = 0; m < M; ++m) acc[i][m] = 0.f;
 
-  for (int t0 = lane; t0 < NT; t0 += 32 * PF) {
+  for (int t0 = lane + 32 * cs; t0 < NT; t0 += 32 * PF * CS) {
     uint4 w[PF][R];
+    __half sc[PF][R]; uint8_t zr[PF][R];
     #pragma unroll
     for (int s = 0; s < PF; ++s) {
-      const int ts = t0 + s * 32;
+      const int ts = t0 + s * 32 * CS;
       #pragma unroll
-      for (int i = 0; i < R; ++i)
+      for (int i = 0; i < R; ++i) {
         w[s][i] = (ts < NT) ? __ldcg(reinterpret_cast<const uint4*>(
                                   data + (size_t)i * rstride + ((size_t)ts << 4)))
                             : make_uint4(0u, 0u, 0u, 0u);
+        if (CBK_SZPRE) {
+          sc[s][i] = (ts < NT) ? scale[(size_t)i * G + (ts >> 2)] : __float2half(0.f);
+          zr[s][i] = (ts < NT) ? zero[(size_t)i * G + (ts >> 2)] : (uint8_t)0;
+        }
+      }
     }
     #pragma unroll
     for (int s = 0; s < PF; ++s) {
-      const int ts = t0 + s * 32;
+      const int ts = t0 + s * 32 * CS;
       if (ts >= NT) break;
       const int col = ts << 5, gg = ts >> 2;
       float qs[R][M], xsa[M], xsb[M];
@@ -658,8 +693,8 @@ __device__ __forceinline__ void gemv_dense4_multi(
       }
       #pragma unroll
       for (int i = 0; i < R; ++i) {
-        const float sf = __half2float(scale[(size_t)i * G + gg]);
-        const float zf = (float)zero[(size_t)i * G + gg];
+        const float sf = CBK_SZPRE ? __half2float(sc[s][i]) : __half2float(scale[(size_t)i * G + gg]);
+        const float zf = CBK_SZPRE ? (float)zr[s][i] : (float)zero[(size_t)i * G + gg];
         #pragma unroll
         for (int m = 0; m < M; ++m)
           acc[i][m] = fmaf(sf, qs[i][m] - zf * ((NX == 2 && (i & 1)) ? xsb[m] : xsa[m]),
@@ -738,6 +773,10 @@ __device__ __forceinline__ void blk1632_q4(uint32_t m32, uint64_t buf, uint32_t 
   const uint32_t e0 = lo, e1 = hi;
   (void)lut;
 #else
+#if CBK_BLK1632_LUT == 4
+  const uint4 lte = reinterpret_cast<const uint4*>(lut)[b8];
+  const uint32_t sel0 = lte.x, sel1 = lte.y, mk0 = lte.z, mk1 = lte.w;
+#else
   const uint32_t sp0 = (((b8 & 0xFu) * 0x00204081u) & 0x01010101u);
   const uint32_t sp1 = ((((b8 >> 4) & 0xFu) * 0x00204081u) & 0x01010101u);
   const uint32_t mk0 = sp0 * 0xFFu;
@@ -748,6 +787,7 @@ __device__ __forceinline__ void blk1632_q4(uint32_t m32, uint64_t buf, uint32_t 
 #else
   const uint32_t sel0 = lut[b8 << 1];
   const uint32_t sel1 = lut[(b8 << 1) | 1];
+#endif
 #endif
   // ZF: pruned slots carry the group's zero code (zb = zero * 0x01010101) instead of 0,
   // so `qs - zf*sum(x)` cancels them and no per-row masked x-sum is needed.
@@ -796,22 +836,25 @@ __device__ __forceinline__ void blk1632_q4(uint32_t m32, uint64_t buf, uint32_t 
   }
 }
 
-template<int M, int R, int NX, int PF, int BITS, bool FLATTAIL>
+template<int M, int R, int NX, int PF, int BITS, bool FLATTAIL, int CS = 1>
 __device__ __forceinline__ void gemv_blk1632_multi(
     const uint8_t* __restrict__ data, size_t rstride,
     const __half* __restrict__ scale, const uint8_t* __restrict__ zero, int G, int N,
     const __nv_bfloat16* __restrict__ xa, const __nv_bfloat16* __restrict__ xb,
-    float acc[R][M]) {
+    float acc[R][M], int cs = 0, int tb = 0, int te = -1) {
+  // [tb, te): the granule sub-range this call covers (default: the whole row).  The chunked
+  // phase driver (gemv_phase_chunk) hands a warp a contiguous run of (row-group, granule) items,
+  // so a row-group may start or end mid-row.
   const int lane = threadIdx.x & 31;
-#if CBK_BLK1632_LUT == 2
+#if CBK_BLK1632_LUT == 2 || CBK_BLK1632_LUT == 4
   const uint32_t* __restrict__ lut = prmt_smem();   // staged once per block at entry
 #else
   const uint32_t* __restrict__ lut = prmt_lut;      // unused when LUT==3
 #endif
-  const int NT = N >> 5;                        // 32-column granules == 16:32 blocks
+  const int NT = (te < 0) ? (N >> 5) : te;      // 32-column granules == 16:32 blocks (end)
   const size_t noff = (size_t)(N >> 3);         // nibble plane base
   const size_t hoff = (size_t)N * 3 >> 3;       // hi2 plane base (BITS==6)
-  const int NTAIL = FLATTAIL ? (NT & 31) : 0;
+  const int NTAIL = FLATTAIL ? ((NT - tb) & 31) : 0;
   const int NMAIN = NT - NTAIL;
   #pragma unroll
   for (int i = 0; i < R; ++i)
@@ -828,14 +871,31 @@ __device__ __forceinline__ void gemv_blk1632_multi(
   uint32_t mnx[PF][R];
   #pragma unroll
   for (int s = 0; s < PF; ++s) {
-    const int ts = lane + s * 32;
+    const int ts = tb + lane + 32 * cs + s * 32 * CS;
     #pragma unroll
     for (int i = 0; i < R; ++i)
       mnx[s][i] = CBK_MLOAD(data + (size_t)i * rstride, ts, ts < NMAIN);
   }
+#elif CBK_BLK1632_MSCHED == 3
+  // full one-iteration lookahead: masks AND nibbles of batch k+1 are issued before batch k is
+  // decoded, so the warp's DRAM latency overlaps its own issue-bound decode (register cost: a
+  // second PF x R x 12 B buffer; use PF 1 to keep the shipped register footprint)
+  uint32_t mnx[PF][R]; uint2 nnx[PF][R];
+  #pragma unroll
+  for (int s = 0; s < PF; ++s) {
+    const int ts = tb + lane + 32 * cs + s * 32 * CS;
+    const bool ok = ts < NMAIN;
+    #pragma unroll
+    for (int i = 0; i < R; ++i) {
+      mnx[s][i] = CBK_MLOAD(data + (size_t)i * rstride, ts, ok);
+      nnx[s][i] = ok ? __ldcg(reinterpret_cast<const uint2*>(data + (size_t)i * rstride + noff + ((size_t)ts << 3)))
+                     : make_uint2(0u, 0u);
+    }
+  }
 #endif
-  for (int t0 = lane; t0 < NMAIN; t0 += 32 * PF) {
+  for (int t0 = tb + lane + 32 * cs; t0 < NMAIN; t0 += 32 * PF * CS) {
     uint32_t mw[PF][R]; uint2 nw[PF][R]; uint32_t hw[PF][R];
+    __half sc[PF][R]; uint8_t zr[PF][R];
 #if CBK_BLK1632_MSCHED == 2
     // the masks for THIS iteration were issued one iteration ago; issue the NEXT ones now
     #pragma unroll
@@ -844,16 +904,32 @@ __device__ __forceinline__ void gemv_blk1632_multi(
       for (int i = 0; i < R; ++i) mw[s][i] = mnx[s][i];
     #pragma unroll
     for (int s = 0; s < PF; ++s) {
-      const int tn = t0 + 32 * PF + s * 32;
+      const int tn = t0 + 32 * PF * CS + s * 32 * CS;
       #pragma unroll
       for (int i = 0; i < R; ++i)
         mnx[s][i] = CBK_MLOAD(data + (size_t)i * rstride, tn, tn < NMAIN);
+    }
+#elif CBK_BLK1632_MSCHED == 3
+    #pragma unroll
+    for (int s = 0; s < PF; ++s)
+      #pragma unroll
+      for (int i = 0; i < R; ++i) { mw[s][i] = mnx[s][i]; nw[s][i] = nnx[s][i]; }
+    #pragma unroll
+    for (int s = 0; s < PF; ++s) {
+      const int tn = t0 + 32 * PF * CS + s * 32 * CS;
+      const bool okn = tn < NMAIN;
+      #pragma unroll
+      for (int i = 0; i < R; ++i) {
+        mnx[s][i] = CBK_MLOAD(data + (size_t)i * rstride, tn, okn);
+        nnx[s][i] = okn ? __ldcg(reinterpret_cast<const uint2*>(data + (size_t)i * rstride + noff + ((size_t)tn << 3)))
+                        : make_uint2(0u, 0u);
+      }
     }
 #elif CBK_BLK1632_MSCHED == 1
     // every mask load of this iteration issued before any nibble load
     #pragma unroll
     for (int s = 0; s < PF; ++s) {
-      const int ts = t0 + s * 32;
+      const int ts = t0 + s * 32 * CS;
       #pragma unroll
       for (int i = 0; i < R; ++i)
         mw[s][i] = CBK_MLOAD(data + (size_t)i * rstride, ts, ts < NMAIN);
@@ -861,7 +937,7 @@ __device__ __forceinline__ void gemv_blk1632_multi(
 #endif
     #pragma unroll
     for (int s = 0; s < PF; ++s) {
-      const int ts = t0 + s * 32;
+      const int ts = t0 + s * 32 * CS;
       const bool ok = (ts < NMAIN);
       #pragma unroll
       for (int i = 0; i < R; ++i) {
@@ -871,17 +947,31 @@ __device__ __forceinline__ void gemv_blk1632_multi(
 #endif
 #if CBK_BLK1632_NOLD & 2
         nw[s][i] = make_uint2(0x12345678u, 0x9ABCDEF0u);  // DIAGNOSTIC: no nibble load
-#else
+#elif CBK_BLK1632_MSCHED != 3
         nw[s][i] = ok ? __ldcg(reinterpret_cast<const uint2*>(rb + noff + ((size_t)ts << 3)))
                       : make_uint2(0u, 0u);
 #endif
         if (BITS == 6)
           hw[s][i] = ok ? __ldcg(reinterpret_cast<const uint32_t*>(rb + hoff) + ts) : 0u;
+        if (CBK_SZPRE) {
+          sc[s][i] = ok ? scale[(size_t)i * G + (ts >> 2)] : __float2half(0.f);
+          zr[s][i] = ok ? zero[(size_t)i * G + (ts >> 2)] : (uint8_t)0;
+        }
       }
     }
+#if CBK_BLK1632_LOADONLY
+    // DIAGNOSTIC: the weight stream is consumed by a 3-op hash and the decode is REMOVED.
+    // WRONG RESULT; it measures the phase's memory floor (what a free decoder would leave).
+    #pragma unroll
+    for (int s = 0; s < PF; ++s)
+      #pragma unroll
+      for (int i = 0; i < R; ++i)
+        acc[i][0] += __uint_as_float((mw[s][i] ^ nw[s][i].x ^ nw[s][i].y) & 0x3FFFFFFFu);
+    continue;
+#endif
     #pragma unroll
     for (int s = 0; s < PF; ++s) {
-      const int ts = t0 + s * 32;
+      const int ts = t0 + s * 32 * CS;
       if (ts >= NMAIN) break;
       const int col = ts << 5, gg = ts >> 2;
       float qs[R][M], xs[R][M];
@@ -893,7 +983,7 @@ __device__ __forceinline__ void gemv_blk1632_multi(
       for (int m = 0; m < M; ++m) { xsa[m] = 0.f; xsb[m] = 0.f; }
       #pragma unroll
       for (int i = 0; i < R; ++i)
-        zbv[i] = (uint32_t)zero[(size_t)i * G + gg] * 0x01010101u;
+        zbv[i] = (CBK_SZPRE ? (uint32_t)zr[s][i] : (uint32_t)zero[(size_t)i * G + gg]) * 0x01010101u;
 #endif
       #pragma unroll
       for (int i = 0; i < R; ++i)
@@ -951,8 +1041,8 @@ __device__ __forceinline__ void gemv_blk1632_multi(
       }
       #pragma unroll
       for (int i = 0; i < R; ++i) {
-        const float sf = __half2float(scale[(size_t)i * G + gg]);
-        const float zf = (float)zero[(size_t)i * G + gg];
+        const float sf = CBK_SZPRE ? __half2float(sc[s][i]) : __half2float(scale[(size_t)i * G + gg]);
+        const float zf = CBK_SZPRE ? (float)zr[s][i] : (float)zero[(size_t)i * G + gg];
         #pragma unroll
         for (int m = 0; m < M; ++m)
 #if CBK_BLK1632_ZF
@@ -967,7 +1057,7 @@ __device__ __forceinline__ void gemv_blk1632_multi(
   }
 
 #undef CBK_MLOAD
-  if (FLATTAIL && NTAIL) {
+  if (FLATTAIL && NTAIL && cs == 0) {   // the flattened tail is done by slice 0 only
     // flattened (row, granule) work list: item q -> row i, granule NMAIN + (q - i*NTAIL)
     for (int q = lane; q < R * NTAIL; q += 32) {
       int i = 0;

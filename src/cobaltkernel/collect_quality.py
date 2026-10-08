@@ -156,7 +156,7 @@ def compare_only(model, tag):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model", required=True, choices=["gemma-3-4b", "medgemma-27b"])
+    ap.add_argument("--model", required=True, choices=["gemma-3-4b", "medgemma-27b", "biomistral-7b"])
     ap.add_argument("--tag", required=True)
     ap.add_argument("--compare-only", action="store_true")
     ap.add_argument("--out", default=None, help="markdown file to write/update (default results/cobaltkernel/<model>/QUALITY.md)")

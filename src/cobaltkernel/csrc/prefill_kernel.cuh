@@ -39,7 +39,8 @@ struct PLayerW {
 
 struct PArgs {
   const PLayerW* layers;
-  MatDesc embed;                     // tied embedding / lm_head
+  MatDesc embed;                     // token embedding
+  MatDesc lm_head;                   // == embed when tied (gemma3); separate for llama
   const __nv_bfloat16* final_norm;
   const float* inv_local;            // [head_dim/2]
   const float* inv_global;
@@ -60,6 +61,9 @@ struct PArgs {
   int batch_mode;
   float eps, attn_scale, embed_scale;
   int nq_dim, nkv_dim, nqkv, kv_group;
+  // model-family switches (arch.py); null norm pointers in PLayerW bypass that norm
+  int norm_plus_one;   // 1 gemma (1+w, one rounding)  0 llama (round, then w*x)
+  int act_gelu;        // 1 GeGLU  0 SwiGLU
 };
 
 // ------------------------------------------------------------------ small helpers
@@ -69,6 +73,9 @@ __device__ __forceinline__ float rb(float v) { return PF_F(PF_BF(v)); }
 __device__ __forceinline__ int ceildiv(int a, int b) { return (a + b - 1) / b; }
 __device__ __forceinline__ float gelu_tanh(float x) {
   return 0.5f * x * (1.f + tanhf(0.7978845608028654f * (x + 0.044715f * x * x * x)));
+}
+__device__ __forceinline__ float norm_apply(float v, float rr, float w, int plus_one) {
+  return plus_one ? rb(v * rr * (1.f + w)) : rb(rb(v * rr) * w);
 }
 
 // Absolute position of activation row m, and the KV-cache sequence slot it belongs to.

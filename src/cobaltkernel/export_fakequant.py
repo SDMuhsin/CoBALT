@@ -81,7 +81,12 @@ def main():
     ap.add_argument("--embed-bits", type=int, choices=[16, 8, 4], default=16,
                     help="16 = keep the tied embedding/lm_head bf16 (default); 8/4 = DENSE8/DENSE4 RTN "
                          "matching what the kernel arm serves")
+    ap.add_argument("--lm-head-bits", type=int, choices=[16, 8, 4], default=None,
+                    help="bits for lm_head.weight only (default None = same as --embed-bits, i.e. unchanged "
+                         "behaviour); the kernel can serve lm_head DENSE8 independently of the embedding")
     a = ap.parse_args()
+    if a.lm_head_bits is None:
+        a.lm_head_bits = a.embed_bits
     dev = torch.device(a.device if torch.cuda.is_available() else "cpu")
     os.makedirs(a.out, exist_ok=True)
     man = json.load(open(os.path.join(a.art, "manifest.json")))
@@ -118,11 +123,12 @@ def main():
                             print(f"[warn] layer {li} {name} relerr {rel:.4f} != manifest {exp:.4f}", flush=True)
                         t = w_hat
                         n_rep += 1
-                elif a.embed_bits < 16 and k in EMBED_KEYS:
+                elif k in EMBED_KEYS and (a.lm_head_bits if k == "lm_head.weight" else a.embed_bits) < 16:
+                    eb = a.lm_head_bits if k == "lm_head.weight" else a.embed_bits
                     w_ref = t
-                    t = dequant_embed(w_ref, a.embed_bits, dev)
+                    t = dequant_embed(w_ref, eb, dev)
                     rel = float((t.float() - w_ref.float()).norm() / w_ref.float().norm())
-                    print(f"[{time.strftime('%F %T')}] embed {k} {tuple(t.shape)} -> DENSE{a.embed_bits} "
+                    print(f"[{time.strftime('%F %T')}] embed {k} {tuple(t.shape)} -> DENSE{eb} "
                           f"relerr={rel:.5f}", flush=True)
                     n_emb += 1
                     del w_ref

@@ -48,13 +48,15 @@ def decode(artifact_dir: str, config_dir: str | None = None, recipe=None,
     m = _model.CobaltModel.load(artifact_dir, config_dir=config_dir, recipe=r,
                                 batch=1, max_ctx=prompt + gen + 8)
     ids = _synthetic_prompt(prompt)
+    st = m.stats
     out: dict = {"recipe": r.name, "layout": r.layout, "bpw": r.bpw,
                  "protocol": f"{prompt}->{gen}, batch 1, greedy",
                  "device": torch.cuda.get_device_name(0),
-                 "weight_bytes_per_token": m.stats["weight_bytes_per_token"],
-                 "layers": m.stats["layers"], "hidden": m.stats["hidden"]}
+                 "weight_bytes_per_token": st["weight_bytes_per_token"],
+                 "target": st["target"], "model_type": st["model_type"],
+                 "layers": st["layers"], "hidden": st["hidden"]}
 
-    with _recipes.activate(r):
+    with _recipes.activate(r, m._mcfg):
         run = m._r
         # warmup also pays the one-off JIT build and allocation costs
         run.reset()
@@ -112,7 +114,7 @@ def _batched(artifact_dir, config_dir, r, M, prompt, gen) -> dict:
     m = _model.CobaltModel.load(artifact_dir, config_dir=config_dir, recipe=r,
                                 batch=M, max_ctx=prompt + gen + 8)
     ids = _synthetic_prompt(prompt)
-    with _recipes.activate(r):
+    with _recipes.activate(r, m._mcfg):
         run = m._r
         run.reset()
         for t in range(8):
@@ -137,23 +139,32 @@ def _batched(artifact_dir, config_dir, r, M, prompt, gen) -> dict:
 
 
 def compare_to_reference(result: dict) -> str:
-    """Render a measurement next to the numbers recorded for the same recipe."""
+    """Render a measurement next to the numbers recorded for the same (model, recipe).
+
+    The reference is looked up by the benchmarked model's own config (`target`), never by
+    assumption: a run on a model we ship no numbers for prints the measurement alone.
+    """
     r = _recipes.get(result["recipe"])
-    ref = r.reference
+    cfg = {"model_type": result.get("model_type"), "hidden_size": result.get("hidden") or 0}
+    t = _recipes.target_for(cfg)
+    ref = t.reference.get(r.name) if t else None
+    lines = [f"recipe {r.name} ({r.bpw:.4f} bpw) on {result.get('device')}"]
+    if ref is None:
+        lines += ["", f"NOTE: no reference numbers for recipe {r.name} on this model "
+                      f"(model_type={result.get('model_type')}, {result.get('layers')} layers / "
+                      f"{result.get('hidden')} hidden). Shipped targets: "
+                      + ", ".join(f"{x.name} [{', '.join(x.reference)}]"
+                                  for x in _recipes.TARGETS.values()) + "."]
+        return "\n".join(lines)
     rows = [("decode tok/s", result.get("decode_tok_s"), ref["decode_tok_s"]),
             ("TTFT ms", result.get("ttft_ms"), ref["ttft_ms"]),
             ("prefill tok/s", result.get("prefill_tok_s"), ref["prefill_tok_s"])]
-    rm = _recipes.REFERENCE_MODEL
-    same = (result.get("layers") == rm["layers"] and result.get("hidden") == rm["hidden"])
-    lines = [f"recipe {r.name} ({r.bpw:.4f} bpw) on {result.get('device')}",
-             f"{'metric':<16}{'measured':>12}{'reference':>12}{'ratio':>9}"]
+    lines.append(f"{'metric':<16}{'measured':>12}{'reference':>12}{'ratio':>9}")
     for nm, got, exp in rows:
-        ratio = (f"{got / exp:.3f}" if same and got and exp else "n/a")
+        ratio = f"{got / exp:.3f}" if got and exp else "n/a"
         lines.append(f"{nm:<16}{got!s:>12}{exp!s:>12}{ratio:>9}")
-    if not same:
-        lines += ["", f"NOTE: this run is a {result.get('layers')}-layer / "
-                      f"{result.get('hidden')}-hidden model; the reference is "
-                      f"{rm['name']} ({rm['layers']} layers / {rm['hidden']} hidden). "
-                      "Ratios are withheld because they would not compare like with like."]
-    lines += ["", "reference numbers were measured on:", "  " + _recipes.REFERENCE_NOTE]
+    b = t.baseline
+    lines += ["", f"llama.cpp Q4_K_M on the reference slice: {b['decode_tok_s']} tok/s "
+                  f"({b['artifact_gb']} GB); this recipe measured {ref['x_q4km']}x that.",
+              "", f"reference numbers ({t.name}) were measured on:", "  " + t.reference_note]
     return "\n".join(lines)

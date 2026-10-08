@@ -54,6 +54,17 @@ constexpr int PBLK = PF_BLK1632;
 #define PF_BLK1632_O PF_BLK1632
 #endif
 constexpr int PBLKO = PF_BLK1632_O;
+// ---- per-matrix overrides for the fused qkv GEMM and the down_proj GEMM (2026-10-07, mixed-layout
+// arms B/C: 16:32 on gate|up only, DENSE4 attention + down_proj).  Both default to PF_BLK1632, so
+// every existing build is unchanged; gate|up always follows PF_BLK1632.  0 = DENSE4.
+#ifndef PF_BLK1632_QKV
+#define PF_BLK1632_QKV PF_BLK1632
+#endif
+#ifndef PF_BLK1632_D
+#define PF_BLK1632_D PF_BLK1632
+#endif
+constexpr int PBLKQ = PF_BLK1632_QKV;
+constexpr int PBLKD = PF_BLK1632_D;
 
 // ---- the one tile configuration used by every prefill GEMM (measured best of a
 // (MT, WM, S, BR, KT) sweep; reproduce with test_gemm.py --roofline)
@@ -198,19 +209,21 @@ __device__ __forceinline__ void phase_norm(const __nv_bfloat16* X, __nv_bfloat16
 // h += rmsnorm(branch, wb);  then  out = rmsnorm(h, w2).   One warp per row, no barrier.
 __device__ __forceinline__ void phase_addnorm(__nv_bfloat16* H, const __nv_bfloat16* Br,
                                               const __nv_bfloat16* wb, const __nv_bfloat16* w2,
-                                              __nv_bfloat16* Y, int M, int N, float eps) {
+                                              __nv_bfloat16* Y, int M, int N, float eps,
+                                              int plus_one) {
   const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
   const int NV = N >> 3;
   for (int m = blockIdx.x * PF_WARPS + warp; m < M; m += gridDim.x * PF_WARPS) {
     const __nv_bfloat16* b = Br + (size_t)m * N;
     __nv_bfloat16* h = H + (size_t)m * N;
-    const float rr = row_rms(b, N, eps);
+    const float rr = wb ? row_rms(b, N, eps) : 0.f;   // wb null = plain residual (llama)
     float v[8], g[8], hv[8], ss = 0.f;
     for (int t = lane; t < NV; t += 32) {
-      ld8(b + t * 8, v); ld8(wb + t * 8, g); ld8(h + t * 8, hv);
+      ld8(b + t * 8, v); ld8(h + t * 8, hv);
+      if (wb) ld8(wb + t * 8, g);
 #pragma unroll
       for (int i = 0; i < 8; ++i) {
-        hv[i] += rb(v[i] * rr * (1.f + g[i]));
+        hv[i] += wb ? norm_apply(v[i], rr, g[i], plus_one) : v[i];
         hv[i] = rb(hv[i]);                       // the residual add is a bf16 add
         ss += hv[i] * hv[i];
       }
@@ -222,7 +235,7 @@ __device__ __forceinline__ void phase_addnorm(__nv_bfloat16* H, const __nv_bfloa
     for (int t = lane; t < NV; t += 32) {
       ld8(h + t * 8, hv); ld8(w2 + t * 8, g);
 #pragma unroll
-      for (int i = 0; i < 8; ++i) hv[i] = hv[i] * rr2 * (1.f + g[i]);
+      for (int i = 0; i < 8; ++i) hv[i] = norm_apply(hv[i], rr2, g[i], plus_one);
       st8(y + t * 8, hv);
     }
   }
@@ -242,7 +255,7 @@ __device__ __forceinline__ void phase_embed(const PArgs& a) {
     const float rr = row_rms(h, N, a.eps);
     __nv_bfloat16* y = a.xn + (size_t)m * N;
     for (int j = lane; j < N; j += 32)
-      y[j] = PF_BF(PF_F(h[j]) * rr * (1.f + PF_F(w0[j])));
+      y[j] = PF_BF(norm_apply(PF_F(h[j]), rr, PF_F(w0[j]), a.norm_plus_one));
   }
 }
 
@@ -286,12 +299,14 @@ __device__ __forceinline__ void phase_rope(const PArgs& a, const PLayerW& W, int
 #pragma unroll
     for (int i = 0; i < PF_MAXDPL; ++i)
       if (i < DPL) { x[i] = PF_F(src[lane + 32 * i]); ss += x[i] * x[i]; }
+    if (nw) {   // QK-norm; null = RoPE only (llama / mistral)
 #pragma unroll
-    for (int off = 16; off > 0; off >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, off);
-    const float rr = rsqrtf(ss / (float)D + a.eps);
+      for (int off = 16; off > 0; off >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, off);
+      const float rr = rsqrtf(ss / (float)D + a.eps);
 #pragma unroll
-    for (int i = 0; i < PF_MAXDPL; ++i)
-      if (i < DPL) x[i] = rb(x[i] * rr * (1.f + PF_F(nw[lane + 32 * i])));
+      for (int i = 0; i < PF_MAXDPL; ++i)
+        if (i < DPL) x[i] = norm_apply(x[i], rr, PF_F(nw[lane + 32 * i]), a.norm_plus_one);
+    }
     float y[PF_MAXDPL];
 #pragma unroll
     for (int i = 0; i < PF_MAXDPL; ++i)
@@ -614,7 +629,7 @@ __device__ __forceinline__ void phase_attn_batch(const PArgs& a, const PLayerW& 
 // The tile shape is a template parameter because the two entry points carry different
 // __launch_bounds__ (1 vs 2 blocks/SM) and therefore different register budgets.
 template <int BATCH, int MT, int BR, int BR2, int KT, int WM, int S, int TAIL, int BLK = 0,
-          int BLKO = BLK>
+          int BLKO = BLK, int BLKQ = BLK, int BLKD = BLK>
 __device__ __forceinline__ void run_model(const PArgs& a, uint8_t* smem) {
   cg::grid_group grid = cg::this_grid();
   int ts = 0;
@@ -632,7 +647,7 @@ __device__ __forceinline__ void run_model(const PArgs& a, uint8_t* smem) {
   for (int L = 0; L < a.n_layers; ++L) {
     const PLayerW& W = a.layers[L];
     // 1. fused qkv
-    gemm_phase<cbk::EPI_BF16, TAIL, MT, BR2, KT, WM, S, BLK>(W.qkv, a.xn, a.hidden, a.M, a.qkvb, a.nqkv, smem, 0,
+    gemm_phase<cbk::EPI_BF16, TAIL, MT, BR2, KT, WM, S, BLKQ>(W.qkv, a.xn, a.hidden, a.M, a.qkvb, a.nqkv, smem, 0,
                               a.nq_dim, a.nkv_dim);
     grid.sync(); PF_STAMP();
     // 2. QK-norm + RoPE + KV write
@@ -651,20 +666,25 @@ __device__ __forceinline__ void run_model(const PArgs& a, uint8_t* smem) {
     gemm_phase<cbk::EPI_BF16, 0, MT, BR2, KT, WM, S, BLKO>(W.o, a.ao, a.nq_dim, a.M, a.ob, a.hidden, smem, 0, 0, 0);
     grid.sync(); PF_STAMP();
     // 5. residual + post_attention_layernorm, then pre_feedforward_layernorm
-    phase_addnorm(a.h, a.ob, W.post_attn_ln, W.pre_ff_ln, a.xn, a.M, a.hidden, a.eps);
+    phase_addnorm(a.h, a.ob, W.post_attn_ln, W.pre_ff_ln, a.xn, a.M, a.hidden, a.eps,
+                  a.norm_plus_one);
     grid.sync(); PF_STAMP();
-    // 6. gate/up + GeGLU
-    gemm_phase<cbk::EPI_GEGLU_BF16, 0, MT, BR, KT, WM, S, BLK>(W.gateup, a.xn, a.hidden, a.M, a.act, a.inter, smem, 1,
-                                    0, 0);
+    // 6. gate/up + GeGLU (gemma) or SwiGLU (llama) -- uniform branch, both instantiated
+    if (a.act_gelu)
+      gemm_phase<cbk::EPI_GEGLU_BF16, 0, MT, BR, KT, WM, S, BLK>(W.gateup, a.xn, a.hidden, a.M, a.act, a.inter, smem, 1,
+                                      0, 0);
+    else
+      gemm_phase<cbk::EPI_SWIGLU_BF16, 0, MT, BR, KT, WM, S, BLK>(W.gateup, a.xn, a.hidden, a.M, a.act, a.inter, smem, 1,
+                                      0, 0);
     grid.sync(); PF_STAMP();
     // 7. down
-    gemm_phase<cbk::EPI_BF16, 0, MT, BR2, KT, WM, S, BLK>(W.down, a.act, a.inter, a.M, a.db, a.hidden, smem, 0, 0, 0);
+    gemm_phase<cbk::EPI_BF16, 0, MT, BR2, KT, WM, S, BLKD>(W.down, a.act, a.inter, a.M, a.db, a.hidden, smem, 0, 0, 0);
     grid.sync(); PF_STAMP();
     // 8. residual + post_feedforward_layernorm, then the next input_layernorm
     //    (the final model norm for the last layer)
     phase_addnorm(a.h, a.db, W.post_ff_ln,
                   (L + 1 < a.n_layers) ? a.layers[L + 1].in_ln : a.final_norm,
-                  a.xn, a.M, a.hidden, a.eps);
+                  a.xn, a.M, a.hidden, a.eps, a.norm_plus_one);
     grid.sync(); PF_STAMP();
   }
 
@@ -679,7 +699,7 @@ __device__ __forceinline__ void run_model(const PArgs& a, uint8_t* smem) {
     }
   }
   grid.sync(); PF_STAMP();
-  gemm_phase<cbk::EPI_F32, 0, MT, BR, KT, WM, S>(a.embed, a.hg, a.hidden, a.R, a.logits, a.vocab, smem, 0, 0, 0);
+  gemm_phase<cbk::EPI_F32, 0, MT, BR, KT, WM, S>(a.lm_head, a.hg, a.hidden, a.R, a.logits, a.vocab, smem, 0, 0, 0);
   grid.sync(); PF_STAMP();
 #undef PF_STAMP
 }
@@ -690,12 +710,12 @@ __device__ __forceinline__ void run_model(const PArgs& a, uint8_t* smem) {
 // path -- which needs all 255 registers for the 128x256 tile -- to fit the same budget.
 __global__ __launch_bounds__(PF_THREADS, 1) void prefill_kernel(PArgs a) {
   extern __shared__ uint8_t smem[];
-  run_model<0, PMT, PBR, PBR2, PKT, PWM, PS, PF_TAILSPLIT, PBLK, PBLKO>(a, smem);
+  run_model<0, PMT, PBR, PBR2, PKT, PWM, PS, PF_TAILSPLIT, PBLK, PBLKO, PBLKQ, PBLKD>(a, smem);
 }
 
 __global__ __launch_bounds__(PF_THREADS, PF_BATCH_MINB) void batch_kernel(PArgs a) {
   extern __shared__ uint8_t smem[];
-  run_model<1, BMT, BBR, BBR2, BKT, BWM, BS, 0, PBLK, PBLKO>(a, smem);
+  run_model<1, BMT, BBR, BBR2, BKT, BWM, BS, 0, PBLK, PBLKO, PBLKQ, PBLKD>(a, smem);
 }
 
 // ------------------------------------------------------------------ host launcher

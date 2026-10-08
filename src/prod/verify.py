@@ -4,8 +4,8 @@ Two levels, cheapest first.
 
 `check_artifact()` -- seconds, no kernel build.  Reads the packed bytes back with the
 torch dequantizer and asserts the things a packing bug breaks: every blob is long enough
-for the arrays the manifest places in it, the bpw accounting adds up, the dequantized
-matrix has exactly the structural zeros the mask promised, and -- for the 16:32 layouts --
+for the arrays the manifest places in it, the bpw accounting adds up, every pruned
+position decodes to an exact zero, and -- for the 16:32 layouts --
 every aligned 32-column block of every row has exactly 16 survivors.
 
 `check_kernel()` -- minutes, builds the CUDA extension.  Runs the megakernel against the
@@ -117,8 +117,12 @@ def check_artifact(artifact_dir: str, layers: int = 2, device: str = "cuda",
                     "zero_fraction": round(frac, 6),
                     "finite": bool(torch.isfinite(W).all())}
             _check(info["finite"], f"{lay['file']}:{nm} has non-finite weights", problems)
-            _check(abs(frac - 0.5) < 0.02,
-                   f"{lay['file']}:{nm} zero fraction {frac:.4f} is not ~0.50", problems)
+            # At least half of every matrix is pruned to an exact zero. MORE than half can
+            # legitimately be zero: a survivor whose code equals its group's zero-point
+            # decodes to 0.0 too (BioMistral-7B layer-0 q_proj reads 0.60). The survivor
+            # count itself is asserted from the stored mask below, not from W != 0.
+            _check(frac >= 0.5 - 0.02,
+                   f"{lay['file']}:{nm} zero fraction {frac:.4f} is below 0.50", problems)
 
             keep = _keep_mask(DQ, blob, e, device)
             if keep is not None:
@@ -134,6 +138,7 @@ def check_artifact(artifact_dir: str, layers: int = 2, device: str = "cuda",
                 # is only zero if the packer put the grid's zero on a representable code.
                 n_bad = int((W[~keep] != 0).sum())
                 info["pruned_nonzero"] = n_bad
+                info["survivors_on_zero_code"] = int((W[keep] == 0).sum())
                 _check(n_bad == 0,
                        f"{lay['file']}:{nm} has {n_bad} pruned positions that do NOT "
                        "decode to exactly zero (zero-point off the quantization grid)",
@@ -147,7 +152,14 @@ def check_artifact(artifact_dir: str, layers: int = 2, device: str = "cuda",
     return rep
 
 
-def check_kernel(artifact_dir: str, config_dir: str, prompt_len: int = 1152,
+# (iii) on the tensor-core decode build: M=1 runs qkv/o_proj on mma with fp32 slice sums,
+# M>1 runs the row loop, so the two are different correct reduction orders. The gate is
+# then identical greedy tokens plus this bound on max |logit diff| (measured 0.09-0.14 on
+# BioMistral-7B; the same-code GEMM-vs-GEMV reference control is 0.97).
+BATCH_TOL_TENSOR_CORE = 0.5
+
+
+def check_kernel(artifact_dir: str, config_dir: str | None = None, prompt_len: int = 1152,
                  steps: int = 32, recipe=None, out: str | None = None) -> None:
     """Run the megakernel against the pure-torch reference on the same bytes.
 
@@ -165,9 +177,11 @@ def check_kernel(artifact_dir: str, config_dir: str, prompt_len: int = 1152,
          else recipe or _model.recipe_for_artifact(artifact_dir))
     # --ref-packed builds the torch oracle by dequantizing the SAME packed bytes the
     # kernel reads, so any disagreement is a kernel bug and not a quantization difference.
-    argv = ["--model", artifact_dir, "--config", config_dir, "--ref-packed",
+    argv = ["--model", artifact_dir, "--config", config_dir or artifact_dir, "--ref-packed",
             "--prompt-len", prompt_len, "--steps", steps]
     if out:
         argv += ["--out", out]
-    with _recipes.activate(r):
+    with _recipes.activate(r, _model._model_cfg(config_dir or artifact_dir)):
+        if os.environ.get("COBALT_BLK1632_MMA", "0") != "0":
+            argv += ["--batch-tol", BATCH_TOL_TENSOR_CORE]
         _bridge.run_module_main("cobaltkernel.verify_kernel", argv)

@@ -40,17 +40,28 @@ case $MODEL in
   medgemma-27b)
     HF=/scratch/ckp908/prism_hf/hub/models--unsloth--medgemma-27b-text-it/snapshots/b780610baf99c087ba3719a77cf0dacec7261a65
     NAME=medgemma-27b-text-it; IMATRIX_NGL=${IMATRIX_NGL:-22}; IMATRIX_SRC=${IMATRIX_SRC:-bf16} ;;
+  biomistral-7b)
+    # bf16 safetensors snapshot converted ONCE from BioMistral/BioMistral-7B pytorch_model.bin
+    # (src/cobaltkernel/convert_bin_to_safetensors.py); 14.48 GB fits a 1g.24gb slice fully offloaded
+    HF=/scratch/root/PTQResearch/accel4bit_models/biomistral-7b/hf_bf16
+    NAME=biomistral-7b; IMATRIX_NGL=${IMATRIX_NGL:-99}; IMATRIX_SRC=${IMATRIX_SRC:-bf16} ;;
   *) echo "unknown model $MODEL"; exit 2 ;;
 esac
-TOKENIZER_HF=/scratch/ckp908/prism_hf/hub/models--unsloth--medgemma-27b-text-it/snapshots/b780610baf99c087ba3719a77cf0dacec7261a65
+# tokenizer used ONLY for the calibration text dump + the (unused) server fallback; the calib text is
+# model-agnostic, so every model shares the same dump and the medgemma tokenizer is kept for reproducibility
+TOKENIZER_HF=${TOKENIZER_HF:-/scratch/ckp908/prism_hf/hub/models--unsloth--medgemma-27b-text-it/snapshots/b780610baf99c087ba3719a77cf0dacec7261a65}
 MD=/scratch/root/PTQResearch/accel4bit_models/$MODEL/gguf
-RES=$ROOT/results/accel4bit/$MODEL/gguf
-CALIB=$ROOT/results/accel4bit/calib_ultrachat_512x2048.txt
+# VARIANT (env, default empty = the shipped arm, every path unchanged): suffix for an alternative imatrix/Q4_K_M build,
+# e.g. VARIANT=_medcal CALIB_FILE=results/accel4bit/calib_med_512x2048.txt -> own imatrix + Q4_K_M + results dir gguf_medcal
+# (matched-lever control for CoBALT's medical-calibration arm; the bf16 GGUF is shared).
+VARIANT=${VARIANT:-}
+RES=$ROOT/results/accel4bit/$MODEL/gguf$VARIANT
+CALIB=${CALIB_FILE:-$ROOT/results/accel4bit/calib_ultrachat_512x2048.txt}
 WIKI=$ROOT/results/accel4bit/wiki.test.raw
 BF16=$MD/$NAME-bf16.gguf
 Q8=$MD/$NAME-Q8_0.gguf
-IMATRIX=$MD/$NAME-imatrix.gguf
-Q4=$MD/$NAME-Q4_K_M.gguf
+IMATRIX=$MD/$NAME-imatrix$VARIANT.gguf
+Q4=$MD/$NAME-Q4_K_M$VARIANT.gguf
 mkdir -p $MD $RES
 
 gguf_for_tag() {

@@ -682,6 +682,21 @@ def pack_artifact(raw_dir, out_dir, layout=SPARSE4, embed_layout=DENSE4, fuse_ga
         man["embed"]["file"] = "embed.bin"
         del W
         man["embed"]["bytes"] = bw.close()
+        # untied lm_head (llama family): packed with the SAME layout/bits as the embedding
+        cfg_p = os.path.join(model_path, "config.json")
+        cfg = json.load(open(cfg_p)) if os.path.exists(cfg_p) else {}
+        cfg = cfg.get("text_config", cfg)
+        tied = cfg.get("tie_word_embeddings", not rd.has("lm_head.weight"))
+        if not tied and rd.has("lm_head.weight"):
+            bw = BlobWriter(os.path.join(out_dir, "lm_head.bin"))
+            W = rd.get("lm_head.weight")
+            man["lm_head"] = pack_embedding(bw, W, embed_layout, embed_bits, device)
+            man["lm_head"]["file"] = "lm_head.bin"
+            del W
+            man["lm_head"]["bytes"] = bw.close()
+            print(f"[pack] untied lm_head -> lm_head.bin ({man['lm_head']['bytes']/2**20:.1f} MiB)", flush=True)
+        else:
+            man["lm_head"] = None
         bw = BlobWriter(os.path.join(out_dir, "misc.bin"))
         misc = {}
         if rd.has("model.norm.weight"):

@@ -1,5 +1,9 @@
 #!/usr/bin/env python
-"""Memory-streamed, layer-wise CoBALT quantizer for Gemma3 text models.
+"""Memory-streamed, layer-wise CoBALT quantizer for Gemma3 / Mistral / Llama decoder models.
+
+Model family is read from config.json `model_type` (see `family_of`); the Gemma3 path is
+unchanged, the Llama-style path (mistral, llama) differs only in how the skeleton layer is
+built and called -- the quantization math is identical.
 
 Designed to quantize MedGemma-27B (62 layers, bf16 54 GB) inside a single MIG
 slice: the model is NEVER materialised -- decoder layers are constructed on
@@ -70,6 +74,32 @@ def load_config(model_path):
     return cfg
 
 
+def family_of(cfg):
+    """'gemma3' (dual RoPE, 4 norms, QK-norm, tied embed*scale) or 'llama' (mistral/llama:
+    one RoPE, 2 norms, no QK-norm, untied lm_head, no embed scale)."""
+    mt = getattr(cfg, "model_type", "")
+    if mt.startswith("gemma3"):
+        return "gemma3"
+    if mt in ("mistral", "llama"):
+        return "llama"
+    raise NotImplementedError(f"model_type={mt!r}: only gemma3 / mistral / llama are wired")
+
+
+def build_skeleton(cfg, family):
+    from accelerate import init_empty_weights
+    if family == "gemma3":
+        from transformers.models.gemma3.modeling_gemma3 import Gemma3TextModel as Cls
+    elif cfg.model_type == "mistral":
+        from transformers.models.mistral.modeling_mistral import MistralModel as Cls
+    else:
+        from transformers.models.llama.modeling_llama import LlamaModel as Cls
+    torch.set_default_dtype(torch.bfloat16)
+    with init_empty_weights():
+        skel = Cls(cfg)
+    torch.set_default_dtype(torch.float32)
+    return skel
+
+
 # ------------------------------------------------------------------ weight streaming
 class ShardReader:
     def __init__(self, model_dir):
@@ -118,7 +148,7 @@ def build_calib(model_path, calib, n_calib, seq_len, calib_file, offset=0):
             stream.extend(tok(s, add_special_tokens=False)["input_ids"])
             if len(stream) >= (offset + n_calib + 1) * seq_len:
                 break
-        src = f"{calib_file} (ultrachat_200k/train_sft seed42, packed, block offset {offset})"
+        src = f"{calib_file} ({'ultrachat_200k/train_sft seed42, ' if 'ultrachat' in calib_file else ''}packed text, block offset {offset})"
     elif calib == "wikitext2":
         from datasets import load_dataset
         ds = load_dataset("wikitext", "wikitext-2-raw-v1", split="train")
@@ -168,6 +198,24 @@ def main():
                     help="comma-separated module names (e.g. 'self_attn.o_proj') that KEEP the canonical "
                          "global top-k even when --mask-block is set. Default empty = no exclusions, i.e. "
                          "bit-identical to a plain --mask-block run.")
+    ap.add_argument("--sparsity-override", default="",
+                    help="per-matrix sparsity, comma-separated 'module=sp' (e.g. 'self_attn.o_proj=0.0,"
+                         "mlp.down_proj=0.0' keeps those DENSE: no mask, no OBS). Default empty = every "
+                         "matrix uses --sparsity, bit-identical to a run without this flag.")
+    ap.add_argument("--quant-mode", choices=["rtn", "gptq"], default="rtn",
+                    help="survivor quantizer: 'rtn' = shipped group min-max RTN (bit-identical default); "
+                         "'gptq' = sequential column-wise OBS error feedback under the FIXED CoBALT mask "
+                         "(exact joint-OBS pruning compensation + rounding-error compensation)")
+    ap.add_argument("--clip", choices=["none", "mse", "aw"], default="none",
+                    help="per-group (scale, zero) search on a fixed global grid: none = min-max (default, "
+                         "bit-identical); mse = unweighted; aw = activation-weighted (output-error diagonal)")
+    ap.add_argument("--actorder", action="store_true",
+                    help="gptq only: process columns by descending Hessian diagonal with STATIC groups")
+    ap.add_argument("--gptq-block", type=int, default=128)
+    ap.add_argument("--heldout-calib", type=int, default=0,
+                    help="extra calibration blocks (taken AFTER the n-calib fit blocks) whose Gram is kept "
+                         "separate and used only to report a HELD-OUT output error per matrix (eout_ho); "
+                         "0 = off (bit-identical to the shipped path)")
     ap.add_argument("--mask-block", type=int, default=0,
                     help="fixed-cardinality block mask: keep exactly block*(1-sparsity) of every "
                          "aligned block of <block> input columns (32 => CoBALT-16:32). "
@@ -180,38 +228,39 @@ def main():
     os.makedirs(a.out, exist_ok=True)
     t_all = time.time()
 
-    from accelerate import init_empty_weights
-    from transformers.models.gemma3.modeling_gemma3 import Gemma3TextModel
     from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
 
     cfg = load_config(a.model_path)
+    family = family_of(cfg)
     nlayers = cfg.num_hidden_layers if a.layers_limit <= 0 else min(a.layers_limit, cfg.num_hidden_layers)
-    log(f"model={a.model_path} layers={cfg.num_hidden_layers} (processing {nlayers}) "
-        f"hidden={cfg.hidden_size} inter={cfg.intermediate_size}")
+    log(f"model={a.model_path} family={family} ({cfg.model_type}) layers={cfg.num_hidden_layers} "
+        f"(processing {nlayers}) hidden={cfg.hidden_size} inter={cfg.intermediate_size}")
 
-    ids, calib_src, n_calib = build_calib(a.model_path, a.calib, a.n_calib, a.seq_len,
-                                          a.calib_file, a.calib_offset)
-    log(f"calib: {n_calib} x {a.seq_len} tokens from {calib_src}")
+    ids, calib_src, n_tot = build_calib(a.model_path, a.calib, a.n_calib + a.heldout_calib, a.seq_len,
+                                        a.calib_file, a.calib_offset)
+    n_calib = min(a.n_calib, n_tot)
+    n_ho = n_tot - n_calib
+    log(f"calib: {n_calib} x {a.seq_len} tokens from {calib_src}" + (f" + {n_ho} HELD-OUT blocks" if n_ho else ""))
 
     reader = ShardReader(a.model_path)
-    torch.set_default_dtype(torch.bfloat16)
-    with init_empty_weights():
-        skel = Gemma3TextModel(cfg)
-    torch.set_default_dtype(torch.float32)
+    skel = build_skeleton(cfg, family)
 
     # ---- embeddings + rotary (real tensors) ----
     embed = materialize(skel.embed_tokens, dev)
     embed.load_state_dict({"weight": reader.get("model.embed_tokens.weight")})
-    assert float(embed.embed_scale) > 0, "embed_scale lost"
-    rot_g, rot_l = skel.rotary_emb.to(dev), skel.rotary_emb_local.to(dev)
+    if family == "gemma3":
+        assert float(embed.embed_scale) > 0, "embed_scale lost"
+        rot_g, rot_l = skel.rotary_emb.to(dev), skel.rotary_emb_local.to(dev)
+    else:
+        rot_g, rot_l = skel.rotary_emb.to(dev), None
 
     # ---- hidden state buffers (pinned CPU or GPU) ----
     H0, T = cfg.hidden_size, a.seq_len
     buf_dev = "cpu" if a.acts_device == "cpu" else dev
-    inp = torch.empty(n_calib, T, H0, dtype=torch.bfloat16,
+    inp = torch.empty(n_tot, T, H0, dtype=torch.bfloat16,
                       device=buf_dev, pin_memory=(buf_dev == "cpu"))
     with torch.no_grad():
-        for i in range(n_calib):
+        for i in range(n_tot):
             inp[i].copy_(embed(ids[i].to(dev)))
     embed.to("cpu"); del embed; torch.cuda.empty_cache()
     out = torch.empty_like(inp) if a.seq_inputs else None
@@ -220,19 +269,43 @@ def main():
     dummy = torch.zeros(1, T, H0, dtype=torch.bfloat16, device=dev)
     cache_position = torch.arange(T, device=dev)
     position_ids = cache_position.unsqueeze(0)
-    with torch.no_grad():
-        pe_g = rot_g(dummy, position_ids)
-        pe_l = rot_l(dummy, position_ids)
     mk = dict(config=cfg, input_embeds=dummy, attention_mask=None,
               cache_position=cache_position, past_key_values=None, position_ids=position_ids)
-    masks = {"full_attention": create_causal_mask(**mk),
-             "sliding_attention": create_sliding_window_causal_mask(**mk)}
+    with torch.no_grad():
+        pe_g = rot_g(dummy, position_ids)
+        if family == "gemma3":
+            pe_l = rot_l(dummy, position_ids)
+            masks = {"full_attention": create_causal_mask(**mk),
+                     "sliding_attention": create_sliding_window_causal_mask(**mk)}
+        else:
+            # mistral: uniform sliding window when config.sliding_window is set (HF: same rule)
+            sw = getattr(cfg, "sliding_window", None)
+            masks = {"llama": (create_sliding_window_causal_mask(**mk) if sw
+                               else create_causal_mask(**mk))}
+            log(f"llama-family mask: {'sliding window ' + str(sw) if sw else 'full causal'} "
+                f"(seq_len {T}{' < window -> no effect' if sw and T <= sw else ''})")
     del dummy
+
+    def call_layer(layer, h, amask):
+        if family == "gemma3":
+            o = layer(h, position_embeddings_global=pe_g, position_embeddings_local=pe_l,
+                      attention_mask=amask, position_ids=position_ids,
+                      past_key_value=None, use_cache=False, cache_position=cache_position)
+        else:
+            o = layer(h, attention_mask=amask, position_ids=position_ids,
+                      past_key_value=None, use_cache=False, cache_position=cache_position,
+                      position_embeddings=pe_g)
+        return o[0] if isinstance(o, tuple) else o
+
+    def mask_for(layer):
+        return masks[layer.attention_type] if family == "gemma3" else masks["llama"]
 
     manifest = dict(model_path=a.model_path, config=dict(
         sparsity=a.sparsity, bits=a.bits, beta=a.beta, group_size=a.group_size, hull=a.hull,
         calib=a.calib, calib_source=calib_src, n_calib=n_calib, seq_len=a.seq_len,
         calib_offset=a.calib_offset, mask_block=a.mask_block,
+        quant_mode=a.quant_mode, clip=a.clip, actorder=bool(a.actorder), gptq_block=a.gptq_block,
+        heldout_calib=n_ho,
         mask_block_exclude=[x for x in a.mask_block_exclude.split(",") if x.strip()],
         bits_override=a.bits_override,
         seq_inputs=bool(a.seq_inputs), damping_frac=a.damping_frac, tf32=not a.no_tf32,
@@ -240,9 +313,15 @@ def main():
                 + (f"per-{a.mask_block}-block top-{a.mask_block - int(a.mask_block * a.sparsity)}"
                    + (f" (EXCEPT {a.mask_block_exclude} = global topk)" if a.mask_block_exclude else "")
                    if a.mask_block > 0 else "global topk")
-                + " + OBS + col-scale + group-RTN")),
+                + " + OBS + col-scale + "
+                + ("group-RTN" if a.quant_mode == "rtn" else
+                   f"GPTQ-seq({'actorder,static-groups' if a.actorder else 'dynamic-groups'})")
+                + (f" + clip={a.clip}" if a.clip != "none" else ""))),
         hidden_size=H0, num_hidden_layers=cfg.num_hidden_layers, layers_processed=nlayers,
-        quantized_modules=LINEARS, unquantized="embed_tokens, lm_head (tied), all RMSNorms kept bf16",
+        model_type=cfg.model_type, family=family,
+        quantized_modules=LINEARS,
+        unquantized=("embed_tokens, lm_head (tied), all RMSNorms kept bf16" if family == "gemma3"
+                     else "embed_tokens, lm_head (untied), all RMSNorms kept bf16"),
         layers={}, artifact_schema=dict(
             mask="uint8 [K, N/8] bitmap, LSB-first: keep(k,j) = (mask[k, j//8] >> (j%8)) & 1",
             q="uint8 [K, N] group-RTN codes, pruned positions = 0",
@@ -260,6 +339,18 @@ def main():
     if bover:
         log(f"per-matrix BITS overrides: {bover}")
 
+    sover = {}
+    for tok in a.sparsity_override.split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        mn, _, sv = tok.partition("=")
+        assert mn in LINEARS, f"--sparsity-override name not in LINEARS: {mn}"
+        sover[mn] = float(sv)
+    if sover:
+        log(f"per-matrix SPARSITY overrides: {sover}")
+        manifest["config"]["sparsity_override"] = sover
+
     excl = set(x for x in a.mask_block_exclude.split(",") if x.strip())
     if excl:
         unknown = excl - set(LINEARS)
@@ -269,6 +360,7 @@ def main():
     tot_num, tot_den_dense, tot_den_surv, tot_params, tot_surv = 0, 0, 0, 0, 0
     tot_bits_dense = tot_bits_surv = 0
     peak_mem = 0
+    ho_num = ho_den = 0.0
 
     for li in range(nlayers):
         t0 = time.time()
@@ -277,18 +369,20 @@ def main():
         missing = layer.load_state_dict(sd, strict=True)
         del sd
         layer.eval()
-        amask = masks[layer.attention_type]
+        amask = mask_for(layer)
 
         # ---- Hessian accumulation over ALL calibration tokens ----
-        Hs, hooks = {}, []
+        Hs, Hs_ho, hooks = {}, {}, []
+        ho_flag = [False]
 
         def mk_hook(gname):
             def hook(mod, args):
                 X = args[0]
                 X = X.reshape(-1, X.shape[-1]).float()
-                if gname not in Hs:
-                    Hs[gname] = torch.zeros(X.shape[1], X.shape[1], dtype=torch.float32, device=dev)
-                Hs[gname] += X.T @ X
+                tgt = Hs_ho if ho_flag[0] else Hs
+                if gname not in tgt:
+                    tgt[gname] = torch.zeros(X.shape[1], X.shape[1], dtype=torch.float32, device=dev)
+                tgt[gname] += X.T @ X
             return hook
 
         for gname, src in HOOK_SRC.items():
@@ -296,15 +390,14 @@ def main():
             hooks.append(mod.register_forward_pre_hook(mk_hook(gname)))
 
         with torch.no_grad():
-            for i in range(n_calib):
+            for i in range(n_tot):
+                ho_flag[0] = i >= n_calib
                 h = inp[i].to(dev).unsqueeze(0)
-                o = layer(h, position_embeddings_global=pe_g, position_embeddings_local=pe_l,
-                          attention_mask=amask, position_ids=position_ids,
-                          past_key_value=None, use_cache=False, cache_position=cache_position)
-                o = o[0] if isinstance(o, tuple) else o
+                o = call_layer(layer, h, amask)
                 dst = out if a.seq_inputs else inp
                 dst[i].copy_(o.squeeze(0))          # SYNC: async D2H into the calib buffer was measured unreliable
                 del h, o
+        ho_flag[0] = False
         torch.cuda.synchronize()
         for hk in hooks:
             hk.remove()
@@ -327,12 +420,17 @@ def main():
                 W = mod.weight.data
                 K, N = W.shape
                 assert N % 8 == 0 and N % a.group_size == 0, f"{name}: N={N}"
-                mb = 0 if name in excl else a.mask_block
+                sp = sover.get(name, a.sparsity)
+                mb = 0 if (name in excl or sp == 0.0) else a.mask_block
                 nb = bover.get(name, a.bits)
                 q, scale, zero, c, mask, W_hat, st = cm.cobalt_quantize(
-                    W, Hm, a.sparsity, a.beta, nb, a.group_size, a.hull, a.damping_frac,
-                    mask_block=mb)
+                    W, Hm, sp, a.beta, nb, a.group_size, a.hull, a.damping_frac,
+                    mask_block=mb, quant_mode=a.quant_mode, clip=a.clip, actorder=a.actorder,
+                    gptq_block=a.gptq_block, H_ho=Hs_ho.get(gname))
+                if "eout_ho" in st:
+                    ho_num += st["eout_ho_num"]; ho_den += st["eout_ho_den"]
                 st["mask_block"] = mb
+                st["sparsity_target"] = sp
                 st["bits"] = nb
                 # pack
                 mu = mask.to(torch.uint8).view(K, N // 8, 8)
@@ -353,6 +451,7 @@ def main():
                 del q, scale, zero, c, mask, W_hat, mu, packed
                 torch.cuda.empty_cache()
             del Hm
+            Hs_ho.pop(gname, None)
             torch.cuda.empty_cache()
 
         # ---- optional sequential (compressed-prefix) propagation ----
@@ -360,10 +459,7 @@ def main():
             with torch.no_grad():
                 for i in range(n_calib):
                     h = inp[i].to(dev).unsqueeze(0)
-                    o = layer(h, position_embeddings_global=pe_g, position_embeddings_local=pe_l,
-                              attention_mask=amask, position_ids=position_ids,
-                              past_key_value=None, use_cache=False, cache_position=cache_position)
-                    o = o[0] if isinstance(o, tuple) else o
+                    o = call_layer(layer, h, amask)
                     inp[i].copy_(o.squeeze(0))
                     del h, o
             torch.cuda.synchronize()
@@ -377,9 +473,17 @@ def main():
         peak_mem = max(peak_mem, torch.cuda.max_memory_allocated() // 2**20)
         rel = {k: round(v["relerr"], 4) for k, v in lstats.items()}
         eo = {k: round(v["eout_ratio"], 4) for k, v in lstats.items()}
+        eho = {k: round(v["eout_ho"], 4) for k, v in lstats.items() if "eout_ho" in v}
         log(f"layer {li:02d}/{nlayers} done in {time.time()-t0:.1f}s (fwd {t_fwd:.1f}s) "
             f"peakGPU={peak_mem}MiB Hmax={ {g: '%.2e' % v[0] for g, v in hstat.items()} } "
-            f"relerr={rel} eout={eo}")
+            f"relerr={rel} eout={eo}" + (f" eout_ho={eho}" if eho else ""))
+        if ho_den > 0:
+            # energy-weighted total (dominated by the high-||X|| matrices) + the plain mean of per-matrix ratios
+            manifest["eout_ho_total"] = ho_num / ho_den
+            ehs = [v["eout_ho"] for L in manifest["layers"].values() for v in L.values() if "eout_ho" in v]
+            ecs = [v["eout_ratio"] for L in manifest["layers"].values() for v in L.values()]
+            manifest["eout_ho_mean"] = sum(ehs) / len(ehs)
+            manifest["eout_calib_mean"] = sum(ecs) / len(ecs)
         with open(os.path.join(a.out, "manifest.json"), "w") as f:
             json.dump(manifest, f, indent=1)
 
@@ -398,7 +502,9 @@ def main():
     with open(os.path.join(a.out, "manifest.json"), "w") as f:
         json.dump(manifest, f, indent=1)
     log(f"DONE {nlayers} layers in {manifest['wall_seconds']:.0f}s peakGPU={peak_mem}MiB "
-        f"bpw dense={bpw_dense:.3f} survivor={bpw_surv:.3f} sparsity={manifest['bpw']['global_sparsity']:.4f}")
+        f"bpw dense={bpw_dense:.3f} survivor={bpw_surv:.3f} sparsity={manifest['bpw']['global_sparsity']:.4f}"
+        + (f" eout_ho_total={manifest['eout_ho_total']:.5f} eout_ho_mean={manifest['eout_ho_mean']:.5f} "
+           f"eout_calib_mean={manifest['eout_calib_mean']:.5f}" if ho_den > 0 else ""))
 
 
 if __name__ == "__main__":

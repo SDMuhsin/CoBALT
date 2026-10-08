@@ -51,6 +51,20 @@ case "$MODEL" in
     OHYB4="$AM/gemma-3-4b/cobalt_sp0.5_b4_g128_blk32_ohyb_cbk1f"
     OHYB46="$AM/gemma-3-4b/cobalt_sp0.5_b6_g128_blk32_ohyb4_cbk1f"
     BF16="$AM/gemma-3-4b/text_bf16" ;;
+  biomistral-7b)   # llama family: untied lm_head packed in the artifact, SwiGLU, 2 norms (arch.py)
+    CFG="$AM/biomistral-7b/hf_bf16"
+    DENSE4="$AM/biomistral-7b/cobalt_sp0.5_b4_g128_cbk1_dense4f"
+    B1632_4="$AM/biomistral-7b/cobalt_sp0.5_b4_g128_blk32_cbk1_b1632_4f"
+    B1632_6="$AM/biomistral-7b/cobalt_sp0.5_b6_g128_blk32_cbk1_b1632_6f"
+    OHYB4="$AM/biomistral-7b/cobalt_sp0.5_b4_g128_blk32_ohyb_cbk1f"
+    OHYB46="$AM/biomistral-7b/cobalt_sp0.5_b6_g128_blk32_ohyb4_cbk1f"
+    MIXA="$AM/biomistral-7b/cobalt_mixA_b4_g128_blk32_cbk1f"      # 16:32 qkv+gateup, DENSE4 o_proj+down
+    SP0="$AM/biomistral-7b/cobalt_sp0.0_b4_g128_cbk1_dense4f"     # quant-only dense 4-bit (same bytes as DENSE4)
+    MIXB="$AM/biomistral-7b/cobalt_mixB_b4_g128_blk32_cbk1f"      # 16:32 gate|up only, DENSE4 attention + down
+    MIXB_MED="$AM/biomistral-7b/cobalt_mixB_b4_gptq_aw_medcal_cbk1f"   # same layout; gptq+clip quantizer, medical calibration
+    MIXD_MED="$AM/biomistral-7b/cobalt_mixD_b4_gptq_aw_medcal_cbk1f"
+    B1632_RECONB="$AM/biomistral-7b/cobalt_blk32_b4_gptq_aw_medcal_reconB_cbk1f"   # all-16:32, medical + block reconstruction (same layout/bytes as B1632_4)   # 16:32 q/k/v/o/gate|up, DENSE4 down_proj only; gptq+clip, medical
+    BF16="$CFG" ;;
   *) echo "unknown model '$MODEL'"; exit 2 ;;
 esac
 
@@ -77,6 +91,21 @@ case "$ARM" in
                         export COBALT_BLK1632=4 COBALT_BLK1632_O=0 ;;
   cobalt_b1632_6_ohyb4) DIR="$OHYB46"; CFGARG=(--config "$CFG")
                         export COBALT_BLK1632=6 COBALT_BLK1632_O=0 ;;
+  # mixed-layout arm with a DENSE down_proj: the decode kernel dispatches per matrix at runtime; the
+  # prefill kernel's gemm_tile layout is compile-time (only o_proj has an override), so this arm runs
+  # the v2 protocol (prompt through the decode kernel) -- its TTFT/prefill are NOT comparable.
+  cobalt_mixA)    DIR="${MIXA:?}"; CFGARG=(--config "$CFG"); export COBALT_BLK1632=4 COBALT_NO_PREFILL_KERNEL=1 ;;
+  cobalt_sp0_dense4) DIR="${SP0:?}"; CFGARG=(--config "$CFG") ;;
+  # mixed arm B (2026-10-07): the prefill kernel now takes per-matrix overrides for qkv and down_proj
+  # (PF_BLK1632_QKV / PF_BLK1632_D), so this arm runs the SAME v3 protocol as the uniform arms.
+  cobalt_mixB)        DIR="${MIXB:?}";     CFGARG=(--config "$CFG"); export COBALT_BLK1632=4 COBALT_BLK1632_QKV=0 COBALT_BLK1632_O=0 COBALT_BLK1632_D=0 ;;
+  cobalt_mixB_medcal) DIR="${MIXB_MED:?}"; CFGARG=(--config "$CFG"); export COBALT_BLK1632=4 COBALT_BLK1632_QKV=0 COBALT_BLK1632_O=0 COBALT_BLK1632_D=0 ;;
+  # mixed arm D (2026-10-07 round 2): only down_proj DENSE4; decode dispatches per matrix, prefill takes PF_BLK1632_D=0.
+  cobalt_b1632_4_reconB) DIR="${B1632_RECONB:?}"; CFGARG=(--config "$CFG"); export COBALT_BLK1632=4 ;;
+  # round-3 speed build (2026-10-07): tensor-core decode attention (fused cross-split reduce, fp16 merge slots), LUT4
+  # selector+mask table, one-iteration lookahead in the row decoder (PF 1).  Same artifact and bytes as cobalt_b1632_4.
+  cobalt_b1632_4_fast) DIR="$B1632_4"; CFGARG=(--config "$CFG"); export COBALT_BLK1632=4 COBALT_ATTN_TC=1 COBALT_BLK1632_LUT=4 COBALT_BLK1632_MSCHED=3 COBALT_BLK1632_PFH=2 ;;
+  cobalt_mixD_medcal) DIR="${MIXD_MED:?}"; CFGARG=(--config "$CFG"); export COBALT_BLK1632=4 COBALT_BLK1632_D=0 ;;
   *) echo "unknown arm '$ARM'"; exit 2 ;;
 esac
 
@@ -97,10 +126,13 @@ if [ -n "${COBALT_NO_PREFILL_KERNEL:-}" ] || [ "$ARM" = "cobalt_bf16" ]; then
   PFK=(--no-prefill-kernel)
 fi
 
+# COBALT_BATCH_M: batched M list for the record ("2 4 8" default); set to " " to skip the batched
+# rows (e.g. knob sweeps built with COBALT_M1ONLY=1, where only the M=1 kernel exists).
+BMARG=(--batch-M); for _m in ${COBALT_BATCH_M-2 4 8}; do BMARG+=("$_m"); done
 OUT="$REPO/results/cobaltkernel/$MODEL/speed_oneslice/$ARM.json"
 mkdir -p "$(dirname "$OUT")"
 echo "[cobaltkernel-speed] model=$MODEL arm=$ARM slice=$SL ($ST) -> $OUT"
 exec python "$REPO/src/cobaltkernel/speed_oneslice.py" \
   --model-dir "$DIR" "${CFGARG[@]}" --model-name "$MODEL" --arm "$ARM" \
-  --slice "$SL" --slice-type "$ST" --prompt 512 --gen 128 --batch-M 2 4 8 \
+  --slice "$SL" --slice-type "$ST" --prompt 512 --gen 128 "${BMARG[@]}" \
   "${PFK[@]}" --out "${COBALT_OUT_OVERRIDE:-$OUT}"

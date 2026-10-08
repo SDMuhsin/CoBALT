@@ -29,7 +29,8 @@ namespace cbk {
 enum GemmEpi : int {
   EPI_F32        = 0,  // Y is float*        , Y[m*ldY + row]
   EPI_BF16       = 1,  // Y is __nv_bfloat16*, Y[m*ldY + row]
-  EPI_GEGLU_BF16 = 2   // fused gateup: rows 2i/2i+1 -> Y[m*ldY + i] = gelu(gate)*up, bf16
+  EPI_GEGLU_BF16 = 2,  // fused gateup: rows 2i/2i+1 -> Y[m*ldY + i] = gelu(gate)*up, bf16
+  EPI_SWIGLU_BF16 = 3  // same pairing, silu(gate)*up (llama / mistral)
 };
 
 // ---------------------------------------------------------------- tile geometry
@@ -216,6 +217,7 @@ __device__ __forceinline__ float gelu_tanh(float x) {
   const float k = 0.7978845608028654f;  // sqrt(2/pi)
   return 0.5f * x * (1.f + tanhf(k * (x + 0.044715f * x * x * x)));
 }
+__device__ __forceinline__ float silu_f(float x) { return x / (1.f + __expf(-x)); }
 
 }  // namespace detail
 
@@ -581,11 +583,12 @@ __device__ void gemm_tile(const Mat& w, const __half* col_scale, int cs_pairs, i
         const float v0 = acc[i][j][2 * h + 0];   // weight-row nbase + 2*tig
         const float v1 = acc[i][j][2 * h + 1];   // weight-row nbase + 2*tig + 1
         const int rl0 = nbase + 2 * tig;
-        if (EPI == EPI_GEGLU_BF16) {
+        if (EPI == EPI_GEGLU_BF16 || EPI == EPI_SWIGLU_BF16) {
           if (rl0 + 1 < nrows) {
             const int idx = (row0 + rl0) >> 1;
+            const float g = (EPI == EPI_GEGLU_BF16) ? detail::gelu_tanh(v0) : detail::silu_f(v0);
             reinterpret_cast<__nv_bfloat16*>(Y)[(size_t)m * ldY + idx] =
-                __float2bfloat16(detail::gelu_tanh(v0) * v1);
+                __float2bfloat16(g * v1);
           }
         } else if (EPI == EPI_BF16) {
           if (rl0 + 0 < nrows)

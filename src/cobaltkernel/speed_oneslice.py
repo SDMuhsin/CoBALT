@@ -100,6 +100,8 @@ def main():
     ap.add_argument("--minb-sweep", default=None,
                     help="comma-separated COBALT_MINB values; unused here, see bench")
     ap.add_argument("--out", required=True)
+    ap.add_argument("--no-inkernel", dest="inkernel", action="store_false", default=True,
+                    help="skip the in-kernel multi-token generation measurement")
     a = ap.parse_args()
 
     ts = datetime.datetime.now().isoformat(timespec="seconds")
@@ -196,7 +198,26 @@ def main():
         # ---- phase breakdown on one instrumented step ----
         r.step([cur], [a.prompt + a.gen], timings=True)
         torch.cuda.synchronize()
-        ph = r.phase_times_us()
+        # clock64 ticks -> time needs the SM clock the kernel actually ran at (the slice reported
+        # 2362 MHz under load where the old constant assumed 2430 -> 3% optimistic).  Query it.
+        sm_hz = 2.43e9
+        try:
+            import subprocess
+            q = subprocess.run(["nvidia-smi", "--query-gpu=clocks.sm", "--format=csv,noheader,nounits"],
+                               capture_output=True, text=True, timeout=10).stdout.split()
+            uuid = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+            gl = subprocess.run(["nvidia-smi", "-L"], capture_output=True, text=True, timeout=10).stdout
+            gi = 0
+            for line in gl.splitlines():
+                if line.startswith("GPU "):
+                    gi = int(line.split()[1].rstrip(":"))
+                if uuid and uuid[:16] in line:
+                    break
+            sm_hz = float(q[gi]) * 1e6
+        except Exception as e:  # noqa: BLE001
+            print(f"[warn] SM clock query failed ({e}); using 2.43 GHz", flush=True)
+        rec["sm_clock_mhz_for_stamps"] = round(sm_hz / 1e6)
+        ph = r.phase_times_us(sm_clock_hz=sm_hz)
         rec["phase_breakdown_ms"] = {
             "qkv": round(ph["qkv"] / 1e3, 4),
             "attn": round((ph["attn"] + ph["attn_reduce"]) / 1e3, 4),
@@ -208,6 +229,48 @@ def main():
             "argmax": round(ph["argmax"] / 1e3, 4),
             "total_measured": round(ph["total"] / 1e3, 4),
         }
+        # ---- in-kernel greedy generation: ONE cooperative launch for tokens 2..gen ----
+        # Same per-step arithmetic as step(); the host never sees a token until the end.  The
+        # tokens are checked against the one-launch-per-token path on the same prompt.
+        if getattr(a, "inkernel", True):
+            n_ik = a.gen - 1
+            r.reset()
+            torch.cuda.synchronize()
+            if a.pfk:
+                lg = r.prefill_kernel(ids)
+                cur0 = int(lg[0].argmax())
+            else:
+                for t in range(a.prompt):
+                    lg, nxt = r.step([ids[t]], [t])
+                cur0 = int(nxt.cpu()[0])
+            torch.cuda.synchronize()
+            t2 = time.perf_counter()
+            toks_ik = r.generate_inkernel([cur0], [a.prompt], n_ik)
+            torch.cuda.synchronize()
+            t_ik = time.perf_counter() - t2
+            toks_ik = toks_ik[:, 0].cpu().tolist()
+            # reference: the step path from the same state
+            r.reset()
+            if a.pfk:
+                lg = r.prefill_kernel(ids); cur1 = int(lg[0].argmax())
+            else:
+                for t in range(a.prompt):
+                    lg, nxt = r.step([ids[t]], [t])
+                cur1 = int(nxt.cpu()[0])
+            toks_step = []
+            for s in range(n_ik):
+                lg, nxt = r.step([cur1], [a.prompt + s])
+                cur1 = int(nxt.cpu()[0]); toks_step.append(cur1)
+            match = sum(int(x == y) for x, y in zip(toks_ik, toks_step))
+            rec["single_stream"]["decode_tok_s_inkernel"] = round(n_ik / t_ik, 3)
+            rec["single_stream"]["inkernel_tokens_match_step_path"] = f"{match}/{n_ik}"
+            rec["protocol"]["inkernel_note"] = (
+                f"decode_tok_s_inkernel = tokens 2..{a.gen} generated greedily INSIDE one "
+                f"cudaLaunchCooperativeKernel (kernel feeds its own argmax); {match}/{n_ik} tokens "
+                "identical to the one-launch-per-token path from the same prefill state")
+            print(f"[inkernel] {n_ik} tokens in {t_ik*1e3:.1f} ms = {n_ik/t_ik:.2f} tok/s; "
+                  f"match vs step path {match}/{n_ik}", flush=True)
+
         # ---- kernel dispatch proof ----
         lines, total = kernel_proof(r, [cur], [a.prompt + a.gen])
         pf_lines, pf_total, pf_kern = ([], 0, 0)

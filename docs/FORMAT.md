@@ -207,6 +207,22 @@ result. Do not deploy them.
 
 Reference: llama.cpp Q4_K_M is 16.55 GB at 4.81 bpw.
 
+## 7b. Sizes, BioMistral-7B
+
+32 layers; q 4096×4096, k/v 1024×4096, o 4096×4096, gateup 28672×4096, down 4096×14336;
+6,979,321,856 decoder parameters; embedding 32000×4096 and the **untied** `lm_head`
+(its own `lm_head.bin`, DENSE4) packed separately; 2 RMSNorms per layer in `misc.bin`.
+
+| | DENSE4 | BLK1632_4 |
+|---|---|---|
+| decoder stack (streamed per token) | 3.653 GB | **2.781 GB** |
+| total artifact | 3.79 GB | **2.92 GB** |
+| bpw | 4.1875 | **3.1875** |
+
+Reference: llama.cpp Q4_K_M is 4.37 GB at 4.8 bpw. The same `blk1632_b4` recipe and the
+same CBK1 layout produce both models' artifacts; only the shapes, the untied head and the
+norm set differ, all of which the manifest records.
+
 The embedding is quantized with plain asymmetric group-128 min-max RTN — no mask, no
 compensation, no column scale — because it is read as a lookup, not multiplied. Its
 relative error is 0.1036 at 4 bits and 0.0061 at 8 bits; the 8-bit option costs +0.70 GB

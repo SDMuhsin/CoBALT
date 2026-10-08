@@ -13,7 +13,7 @@ import os
 
 import torch
 
-from . import ref_gemma3 as R
+from . import arch
 
 LAYOUT_SPARSE4, LAYOUT_DENSE4, LAYOUT_DENSE8, LAYOUT_SPARSE4X, LAYOUT_BF16 = 0, 1, 2, 3, 4
 LAYOUT_SPARSE4E = 5
@@ -105,7 +105,9 @@ def dequant_matrix(blob, entry, device, dtype=torch.bfloat16):
 
 def load_state_packed(packed_dir, config_dir, device="cuda", dtype=torch.bfloat16,
                       layers_limit=None):
-    cfg = R.Gemma3RefConfig(json.load(open(os.path.join(config_dir, "config.json"))))
+    cfg_raw = json.load(open(os.path.join(config_dir, "config.json")))
+    R = arch.ref_module(cfg_raw)
+    cfg = R.Gemma3RefConfig(cfg_raw) if arch.family_of(cfg_raw) == "gemma3" else R.LlamaRefConfig(cfg_raw)
     man = json.load(open(os.path.join(packed_dir, "manifest.json")))
     W = {}
 
@@ -113,7 +115,12 @@ def load_state_packed(packed_dir, config_dir, device="cuda", dtype=torch.bfloat1
     emb = dequant_matrix(eb, man["embed"], device, dtype)[: cfg.vocab_size]
     del eb
     W["model.embed_tokens.weight"] = emb
-    W["lm_head.weight"] = emb
+    if man.get("lm_head"):
+        hb = _blob(os.path.join(packed_dir, man["lm_head"]["file"]), device)
+        W["lm_head.weight"] = dequant_matrix(hb, man["lm_head"], device, dtype)[: cfg.vocab_size]
+        del hb
+    else:
+        W["lm_head.weight"] = emb
 
     mb = _blob(os.path.join(packed_dir, man["misc"]["file"]), device)
     norms = {}
@@ -140,17 +147,16 @@ def load_state_packed(packed_dir, config_dir, device="cuda", dtype=torch.bfloat1
         else:
             W[p + "mlp.gate_proj.weight"] = dequant_matrix(b, mm["gate_proj"], device, dtype).clone()
             W[p + "mlp.up_proj.weight"] = dequant_matrix(b, mm["up_proj"], device, dtype).clone()
-        for nn, key in (("input_layernorm", "input_layernorm"),
-                        ("post_attention_layernorm", "post_attention_layernorm"),
-                        ("pre_feedforward_layernorm", "pre_feedforward_layernorm"),
-                        ("post_feedforward_layernorm", "post_feedforward_layernorm"),
-                        ("self_attn.q_norm", "self_attn.q_norm"),
-                        ("self_attn.k_norm", "self_attn.k_norm")):
-            W[p + key + ".weight"] = norms[f"{i}.{nn}"]
+        for nn in arch.all_norm_names():           # whichever norms this family has
+            if f"{i}.{nn}" in norms:
+                W[p + nn + ".weight"] = norms[f"{i}.{nn}"]
         del b
         torch.cuda.empty_cache()
 
     rope = {}
     for lt in sorted(set(cfg.layer_types)):
-        rope[lt] = R._inv_freq(cfg.rope_parameters[lt], cfg.head_dim, device)
+        if arch.family_of(cfg_raw) == "gemma3":
+            rope[lt] = R._inv_freq(cfg.rope_parameters[lt], cfg.head_dim, device)
+        else:
+            rope[lt] = R._inv_freq(cfg.rope_theta, cfg.head_dim, device)
     return {"cfg": cfg, "W": W, "rope": rope, "device": device, "dtype": dtype}

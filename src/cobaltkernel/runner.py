@@ -15,6 +15,11 @@ import os
 
 import torch
 
+try:
+    from cobaltkernel import arch
+except ImportError:          # run from inside src/cobaltkernel
+    import arch
+
 
 def cbk_chunk_len(N, cmax=2048):
     """Mirror of cbk::chunk_len() in gemv_api.cuh."""
@@ -24,17 +29,22 @@ def cbk_chunk_len(N, cmax=2048):
 _EXT = None
 
 
-def _build_ext(verbose=False):
+def _build_ext(verbose=False, kg=2):
     """JIT-build the extension.
 
     MINB (min blocks/SM => the per-thread register budget) is a COMPILE-TIME macro and
     each value gets its own build directory, so `COBALT_MINB=3` recompiles once and is
     then cached.  `COBALT_M1ONLY=1` builds only the M=1 kernel (~2x faster compile) for
-    development iterations.
+    development iterations.  `kg` = the model's query:kv head ratio (attention-phase
+    template parameter, CBK_KG): 2 for Gemma3 (default build name unchanged), 4 for
+    Mistral / Llama-3, 1 for MHA.  COBALT_KG overrides.
     """
     global _EXT
+    kg = int(os.environ.get("COBALT_KG", kg))
+    assert kg in (1, 2, 4, 8), f"kv_group {kg} not supported by the attention phase"
     if _EXT is not None:
-        return _EXT
+        assert _EXT[0] == kg, f"extension already built for kv_group {_EXT[0]}, asked {kg}"
+        return _EXT[1]
     from torch.utils.cpp_extension import load
 
     here = os.path.dirname(os.path.abspath(__file__))
@@ -53,6 +63,7 @@ def _build_ext(verbose=False):
     bft = int(os.environ.get("COBALT_BLK1632_FT", 1))
     grp = int(os.environ.get("COBALT_GATEUP_RP", 0))
     bpx = int(os.environ.get("COBALT_BLK1632_PFX", 1))
+    bph = int(os.environ.get("COBALT_BLK1632_PFH", 1))   # PF divisor for the row phases (PF 2 -> 1 with MSCHED=3 lookahead)
     gsp = int(os.environ.get("COBALT_GATEUP_SPLIT", 0))
     # BLK16_32 per-granule dependency-chain levers.  0 = shipped path.
     #   COBALT_BLK1632_LUT : 0 global const table / 1 __constant__ / 2 __shared__ / 3 arithmetic
@@ -63,7 +74,7 @@ def _build_ext(verbose=False):
     # control build stays bit-for-bit the originally shipped one (no staging, no shared
     # array).  Set COBALT_BLK1632_LUT explicitly to reproduce H's numbers (=0).
     blut = int(os.environ.get("COBALT_BLK1632_LUT", 2 if blk else 0))
-    assert blut in (0, 1, 2, 3), "COBALT_BLK1632_LUT must be 0..3"
+    assert blut in (0, 1, 2, 3, 4), "COBALT_BLK1632_LUT must be 0..4 (4: {sel0,sel1,mk0,mk1} uint4 table in smem)"
     bnox = int(os.environ.get("COBALT_BLK1632_NOXB", 0))
     # COBALT_BLK1632_ZF: DENSE4-style zero-fill of pruned slots in the multi-row BLK
     # decoder (drops the per-row masked x-sum).  Changes rounding -> re-gate numerics.
@@ -79,6 +90,28 @@ def _build_ext(verbose=False):
     bhj = int(os.environ.get("COBALT_BLK1632_HALFJ", 0))
     # COBALT_BLK1632_NOOVH: DIAGNOSTIC, deletes the per-granule selector/mask overhead.
     bnv = int(os.environ.get("COBALT_BLK1632_NOOVH", 0))
+    blo = int(os.environ.get("COBALT_BLK1632_LOADONLY", 0))  # DIAGNOSTIC: weights streamed, decode removed
+    bmm = int(os.environ.get("COBALT_BLK1632_MMA", 0))  # tensor-core 16:32 decode (M == 1)
+    mpf = int(os.environ.get("COBALT_MMA_PF", 4))
+    mnl = int(os.environ.get("COBALT_MMA_NOLD", 0))  # DIAGNOSTIC
+    mco = int(os.environ.get("COBALT_MMA_COAL", 0))
+    mph = int(os.environ.get("COBALT_MMA_PHASES", 3))   # 1 qkv 2 o 4 gate|up 8 down 16 lm_head
+    mpl = int(os.environ.get("COBALT_MMA_PF_L2", 1))
+    ma2 = int(os.environ.get("COBALT_MMA_ACC2", 0))
+    muw = int(os.environ.get("COBALT_MMA_UPW", 4))
+    muo = int(os.environ.get("COBALT_MMA_UPW_O", muw))
+    chk = int(os.environ.get("COBALT_CHUNK", 0))
+    atc = int(os.environ.get("COBALT_ATTN_TC", 0))
+    atr = int(os.environ.get("COBALT_ATTN_TC_REDUCE", 1))
+    msz = int(os.environ.get("COBALT_MMA_SZPRE", 1))
+    atm = int(os.environ.get("COBALT_ATTN_TC_MOVM", 1))
+    avp = int(os.environ.get("COBALT_ATTN_TC_VPRE", 0))
+    att = int(os.environ.get("COBALT_ATTN_TC_TREE", 0))   # register tree merge (4 smem slots)
+    ath = int(os.environ.get("COBALT_ATTN_TC_HALF", 1))   # one-round merge with fp16 O/l slots
+    atq = int(os.environ.get("COBALT_ATTN_TC_QROPE", 0))  # q RoPE inside the fragments (no QK-norm models)   # V loads hoisted before the S mma   # V^T fragments via movmatrix   # MMA tile: scale/zero loads in the prefetch stage   # with ATTN_TC: cross-split reduce fused into the attention phase
+    stm = int(os.environ.get("COBALT_STREAM", 0))   # cp.async-ring row decoder, phase bitmask
+    sts = int(os.environ.get("COBALT_STREAM_S", 3))
+    stp = int(os.environ.get("COBALT_STREAM_PF", 1))   # decode attention on tensor cores (M == 1)   # contiguous equal-work chunking, phase bitmask (1 qkv 2 o 4 gate|up 8 down 16 lm_head)
     # COBALT_XSYNC: DIAGNOSTIC, n extra empty grid.sync per layer.  The slope prices a
     # cooperative barrier in this kernel (what folding the RMS into the GEMV would save).
     xsy = int(os.environ.get("COBALT_XSYNC", 0))
@@ -108,26 +141,47 @@ def _build_ext(verbose=False):
     # COBALT_BLK1632_MSCHED: 0 shipped / 1 masks-first / 2 mask lookahead one iteration.
     bms = int(os.environ.get("COBALT_BLK1632_MSCHED", 0))
     fp = int(os.environ.get("COBALT_FUSEPREP", 1))
+    # COBALT_RMAX: cap on the GEMV row-group size R (pick_R rmax).  4 = shipped.  Small-K phases on a
+    # 7B are latency-bound (one wave); R=1/2 with deeper prefetch shortens the per-warp chain.
+    rmax = int(os.environ.get("COBALT_RMAX", 4))
+    assert rmax in (1, 2, 4, 5, 6, 8)
+    # COBALT_CSPLIT: column-split factor for the qkv/o/down/lm_head GEMV phases (CS consecutive warps
+    # share a row group, each walks 1/CS of the columns; partials summed in smem).  1 = shipped walk.
+    csp = int(os.environ.get("COBALT_CSPLIT", 1))
+    assert csp in (1, 2, 4)
+    # attention: one-pass multi-head combine (needs KG x smem, see KernelRunner smem sizing) and the
+    # number of K-row loads kept in flight per key.  Defaults = shipped behaviour.
+    ac1 = int(os.environ.get("COBALT_ATTN_COMBINE1", 0))
+    aku = int(os.environ.get("COBALT_ATTN_KUNROLL", 8))
+    # residual-phase fusion for layers without post-norms (llama family); gemma layers unaffected
+    fre = int(os.environ.get("COBALT_FUSE_RESID", 0)); assert fre in (0, 1, 2)
+    # COBALT_XSMEM: stage each GEMV phase's activation x' in shared memory once per block (the GEMV
+    # then reads x' from smem instead of re-reading it through L1 per row group).  0 = shipped.
+    szp = int(os.environ.get("COBALT_SZPRE", 0))   # scale/zero loads in the predicated prefetch stage
+    xsm = int(os.environ.get("COBALT_XSMEM", 0)); assert not (xsm and csp > 1), "XSMEM and CSPLIT both use the dynamic smem"
     flags = ["-O3", "--extended-lambda", "-DCBK_X_INTERLEAVED", "-lineinfo",
              f"-DCBK_MINB={minb}", f"-DCBK_PVB={pvb}", f"-DCBK_RTOL={rtol}",
              f"-DCBK_FUSEPREP={fp}", f"-DCBK_BLK1632_ARM={blk}",
              f"-DCBK_BLK1632_FT={bft}",
              f"-DCBK_GATEUP_RP={grp}",
-             f"-DCBK_BLK1632_PFX={bpx}",
+             f"-DCBK_BLK1632_PFX={bpx}", f"-DCBK_BLK1632_PFH={bph}",
              f"-DCBK_GATEUP_SPLIT={gsp}",
              f"-DCBK_BLK1632_LUT={blut}",
              f"-DCBK_BLK1632_NOXB={bnox}",
              f"-DCBK_BLK1632_ZF={bzf}",
              f"-DCBK_BLK1632_HALFJ={bhj}",
-             f"-DCBK_BLK1632_NOOVH={bnv}",
+             f"-DCBK_BLK1632_NOOVH={bnv}", f"-DCBK_BLK1632_LOADONLY={blo}", f"-DCBK_BLK1632_MMA={bmm}", f"-DCBK_MMA_PF={mpf}", f"-DCBK_MMA_NOLD={mnl}", f"-DCBK_MMA_COAL={mco}", f"-DCBK_MMA_PHASES={mph}", f"-DCBK_MMA_PF_L2={mpl}", f"-DCBK_MMA_ACC2={ma2}", f"-DCBK_MMA_UPW={muw}", f"-DCBK_MMA_UPW_O={muo}", f"-DCBK_CHUNK={chk}", f"-DCBK_ATTN_TC={atc}", f"-DCBK_ATTN_TC_REDUCE={atr}", f"-DCBK_MMA_SZPRE={msz}", f"-DCBK_ATTN_TC_MOVM={atm}", f"-DCBK_ATTN_TC_VPRE={avp}", f"-DCBK_ATTN_TC_TREE={att}", f"-DCBK_ATTN_TC_HALF={ath}", f"-DCBK_ATTN_TC_QROPE={atq}", f"-DCBK_STREAM={stm}", f"-DCBK_STREAM_S={sts}", f"-DCBK_STREAM_PF={stp}",
              f"-DCBK_XSYNC={xsy}",
              f"-DCBK_ATTN_DIAG={adg}",
              f"-DCBK_KVONCE={kv1}",
              f"-DCBK_BLK1632_BIAS={bbi}",
              f"-DCBK_BLK1632_NOLD={bnl}",
-             f"-DCBK_BLK1632_MSCHED={bms}", *arch]
+             f"-DCBK_BLK1632_MSCHED={bms}", f"-DCBK_KG={kg}", f"-DCBK_RMAX={rmax}", f"-DCBK_CSPLIT={csp}",
+             f"-DCBK_ATTN_COMBINE1={ac1}", f"-DCBK_ATTN_KUNROLL={aku}", f"-DCBK_FUSE_RESID={fre}", f"-DCBK_XSMEM={xsm}", f"-DCBK_SZPRE={szp}", *arch]
     if m1:
         flags.append("-DCBK_M1ONLY")
+    if os.environ.get("COBALT_PTXAS_V"):      # print registers / spills per kernel at build time
+        flags += ["-Xptxas", "-v"]
     if prof:
         # sub-phase clock64 stamps inside the attention / GEMV phases (block 0 only).
         # Separate build so the shipping kernel carries none of it.
@@ -136,17 +190,20 @@ def _build_ext(verbose=False):
         name=(f"cobalt_megakernel_b{minb}" + (f"_pv{pvb}" if pvb != 4 else "")
               + (f"_rt{rtol}" if rtol != 11 else "") + ("_fp" if fp else "_nofp")
               + (f"_blk{blk}" + ("" if bft else "_noft") if blk else "")
-              + (f"_rp{grp}" if grp else "") + (f"_pfx{bpx}" if bpx != 1 else "") + ("_gsp" if gsp else "")
+              + (f"_rp{grp}" if grp else "") + (f"_pfx{bpx}" if bpx != 1 else "") + (f"_pfh{bph}" if bph != 1 else "") + ("_gsp" if gsp else "")
               + (f"_lut{blut}" if blut else "") + ("_noxb" if bnox else "") + ("_zf" if bzf else "")
-              + ("_hj" if bhj else "") + ("_nov" if bnv else "") + (f"_xs{xsy}" if xsy else "") + (f"_ad{adg}" if adg else "") + ("" if kv1 else "_nokv1") + ("_bias" if bbi else "") + (f"_nold{bnl}" if bnl else "") + (f"_ms{bms}" if bms else "")
-              + ("_m1" if m1 else "") + ("_prof" if prof else "")),
+              + ("_hj" if bhj else "") + ("_nov" if bnv else "") + ("_lo" if blo else "") + (f"_mma{mpf}p{mph}l{mpl}" if bmm else "") + ("_ma2" if ma2 else "") + (f"_uw{muw}" if muw != 4 else "") + (f"_uo{muo}" if muo != muw else "") + ("_mnold" if mnl else "") + ("_mcoal" if mco else "") + (f"_xs{xsy}" if xsy else "") + (f"_ad{adg}" if adg else "") + ("" if kv1 else "_nokv1") + ("_bias" if bbi else "") + (f"_nold{bnl}" if bnl else "") + (f"_ms{bms}" if bms else "")
+              + ("_m1" if m1 else "") + ("_prof" if prof else "")
+              + (f"_kg{kg}" if kg != 2 else "") + (f"_rmax{rmax}" if rmax != 4 else "") + (f"_cs{csp}" if csp != 1 else "")
+              + ("_ac1" if ac1 else "") + (f"_ku{aku}" if aku != 8 else "") + (f"_fr{fre}" if fre else "") + ("_xsm" if xsm else "") + ("_szp" if szp else "") + (f"_ch{chk}" if chk else "") + ("_atc" if atc else "") + ("_nar" if (atc and not atr) else "") + ("_nmsz" if not msz else "") + ("_nmovm" if (atc and not atm) else "") + ("_vpre" if avp else "") + ("_tree" if (atc and att) else "") + ("_nhalf" if (atc and not ath) else "") + ("_qr" if (atc and atq) else "") + (f"_st{stm}s{sts}p{stp}" if stm else "")),
         sources=[os.path.join(src, "bindings.cpp"), os.path.join(src, "megakernel.cu")],
         extra_cflags=["-O3"],
         extra_cuda_cflags=flags,
         extra_include_paths=[src],
         verbose=verbose,
     )
-    return _EXT
+    _EXT = (kg, _EXT)
+    return _EXT[1]
 
 
 # --------------------------------------------------------------------------
@@ -171,7 +228,10 @@ class KernelRunner:
                  smem_bytes=None, verbose=False, config_dir=None,
                  force_bf16=()):
         assert M in (1, 2, 4, 8), "megakernel is instantiated for M in {1,2,4,8}"
-        self.ext = _build_ext(verbose)
+        # the attention phase is templated on the query:kv ratio -> read the config first
+        _cfg0 = json.load(open(os.path.join(config_dir or model_dir, "config.json")))
+        _kg = _cfg0["num_attention_heads"] // _cfg0["num_key_value_heads"]
+        self.ext = _build_ext(verbose, kg=_kg)
         self.device = device
         self.M = M
         self.max_ctx = max_ctx
@@ -192,15 +252,17 @@ class KernelRunner:
         self.inter = cfg["intermediate_size"]
         self.vocab = cfg["vocab_size"]
         self.eps = cfg.get("rms_norm_eps", 1e-6)
-        self.sliding_window = cfg.get("sliding_window", 4096)
+        self.sliding_window = arch.sliding_window(cfg)
         self.nq_dim = self.n_heads * self.head_dim
         self.nkv_dim = self.n_kv * self.head_dim
         self.nqkv = self.nq_dim + 2 * self.nkv_dim
         self.kv_group = self.n_heads // self.n_kv
-        self.attn_scale = float(cfg.get("query_pre_attn_scalar", self.head_dim)) ** -0.5
-        # HF rounds the embedding scale to bf16 BEFORE the multiply
-        self.embed_scale = float(
-            torch.tensor(math.sqrt(H), dtype=torch.bfloat16).float())
+        self.attn_scale = arch.attn_scale(cfg)
+        # model family (arch.py): norm convention, activation, embedding scale, tied head
+        self.arch = arch.flags(cfg)
+        self.family = self.arch["family"]
+        self.embed_scale = self.arch["embed_scale"]
+        self.norm_names = arch.norm_names(cfg)    # 6 kernel roles; None = bypassed
 
         assert self.head_dim % 32 == 0 and self.head_dim <= 256, "head_dim must be 32*k, k<=8"
         # dynamic smem = max(one staged activation chunk, the in-block attention
@@ -208,19 +270,32 @@ class KernelRunner:
         # one staged activation chunk, or the in-block attention combine buffer
         # v2: dynamic smem is only the attention block-combine buffer plus the
         # block's KG query vectors.  The GEMV phases use NO shared memory.
-        need = (8 * self.head_dim + 2 * 8) * 4 + self.kv_group * self.head_dim * 2
+        nslot = 8 * (self.kv_group if int(os.environ.get("COBALT_ATTN_COMBINE1", 0)) else 1)
+        if int(os.environ.get("COBALT_ATTN_TC", 0)):
+            nslot = 8 * self.kv_group        # tensor-core attention: one state slot per (warp, head)
+            if int(os.environ.get("COBALT_ATTN_TC_TREE", 0)):
+                nslot = 4 * self.kv_group    # tree merge: 4 slots; sq aliases the slot buffer
+        need = (nslot * self.head_dim + 2 * nslot) * 4 + self.kv_group * self.head_dim * 2
+        if int(os.environ.get("COBALT_ATTN_TC", 0)) and int(os.environ.get("COBALT_ATTN_TC_TREE", 0)):
+            need = max((nslot * self.head_dim + 2 * nslot) * 4, self.kv_group * self.head_dim * 2)
+        elif int(os.environ.get("COBALT_ATTN_TC", 0)) and int(os.environ.get("COBALT_ATTN_TC_HALF", 1)):
+            need = max(nslot * self.head_dim * 2 + 2 * nslot * 4, self.kv_group * self.head_dim * 2)
+        if int(os.environ.get("COBALT_STREAM", 0)):   # cp.async ring: S x PF x R(4) x 32 lanes x 12 B per warp
+            need = max(need, 8 * int(os.environ.get("COBALT_STREAM_S", 3)) * int(os.environ.get("COBALT_STREAM_PF", 1)) * 4 * 32 * 12)
+        # x' staging budget: the largest activation any GEMV phase reads, x M, as bf16 -- capped so
+        # 2 blocks/SM still fit (MINB=2).  Phases whose x' exceeds the budget fall back to global.
+        self.xsmem_bytes = 0
+        if int(os.environ.get("COBALT_XSMEM", 0)):
+            want = max(3 * H, self.inter) * M * 2
+            self.xsmem_bytes = min(want, int(os.environ.get("COBALT_XSMEM_CAP", 96 * 1024)))
+            need = max(need, self.xsmem_bytes)
+        need = max(need, int(os.environ.get("COBALT_SMEM_MIN", 0)))   # DIAGNOSTIC: inflate the dynamic smem (L1 carve-out price)
         self.smem = int(self._smem_req) if self._smem_req else need
         self.xcap = self.smem // 2
         assert self.smem >= need, f"smem {self.smem} < required {need}"
 
-        # ---- layer types -------------------------------------------------
-        pat = cfg.get("sliding_window_pattern", cfg.get("_sliding_window_pattern", 6))
-        if cfg.get("layer_types"):
-            lt = list(cfg["layer_types"])
-        else:
-            lt = ["sliding_attention" if bool((i + 1) % pat) else "full_attention"
-                  for i in range(self.n_layers)]
-        self.layer_types = lt
+        # ---- layer types (gemma3: 1-in-N sliding; mistral: uniform SWA; llama: none)
+        self.layer_types = arch.layer_types(cfg)
 
         self.model_dir = model_dir
         self.config_dir = config_dir
@@ -284,6 +359,11 @@ class KernelRunner:
         self.embed = W["model.embed_tokens.weight"][: self.vocab].to(dev, dt).contiguous()
         self.final_norm = W["model.norm.weight"].to(dev, dt).contiguous()
         self.embed_desc = self._desc_bf16(self.embed)
+        if self.arch["tied"] or "lm_head.weight" not in W:
+            self.lm_head, self.lm_head_desc = None, list(self.embed_desc)
+        else:
+            self.lm_head = W["lm_head.weight"][: self.vocab].to(dev, dt).contiguous()
+            self.lm_head_desc = self._desc_bf16(self.lm_head)
         self._rope_tables()
 
         self.lw = []
@@ -313,16 +393,14 @@ class KernelRunner:
             dn = W[p + "mlp.down_proj.weight"].to(dev, dt).contiguous()
             keep.append(dn)
             mats.append(self._desc_bf16(dn))
-            ns = [W[p + n].to(dev, dt).contiguous() for n in
-                  ("input_layernorm.weight", "post_attention_layernorm.weight",
-                   "pre_feedforward_layernorm.weight", "post_feedforward_layernorm.weight",
-                   "self_attn.q_norm.weight", "self_attn.k_norm.weight")]
-            keep += ns
+            ns = [W[p + n + ".weight"].to(dev, dt).contiguous() if n else None
+                  for n in self.norm_names]
+            keep += [t for t in ns if t is not None]
             self.lw.append(keep)
             row = []
             for d in mats:
                 row += d
-            row += [t.data_ptr() for t in ns]
+            row += [t.data_ptr() if t is not None else 0 for t in ns]
             row += [1 if self.layer_types[i] == "sliding_attention" else 0, 0]
             assert len(row) == self.LAYERW_FIELDS, len(row)
             rows.append(row)
@@ -347,6 +425,15 @@ class KernelRunner:
         self.blobs["embed"] = blob(man["embed"]["file"])
         self.embed_desc = self._desc_packed(self.blobs["embed"], man["embed"])
         assert self.embed_desc[6] == self.hidden and self.embed_desc[5] >= self.vocab
+        if man.get("lm_head"):           # untied head packed separately (llama family)
+            self.blobs["lm_head"] = blob(man["lm_head"]["file"])
+            self.lm_head_desc = self._desc_packed(self.blobs["lm_head"], man["lm_head"])
+            assert self.lm_head_desc[6] == self.hidden and self.lm_head_desc[5] >= self.vocab
+        else:
+            assert self.arch["tied"], (
+                f"{model_dir}: untied model ({self.cfg.get('model_type')}) but the artifact "
+                "has no packed lm_head -- repack with --model-path")
+            self.lm_head_desc = list(self.embed_desc)
 
         # misc.bin: all RMSNorm weights as fp32 -> bf16 on device
         misc = blob(man["misc"]["file"])
@@ -388,26 +475,16 @@ class KernelRunner:
                     f"layer {i} {nm}: SPARSE layout cannot be column-sliced and "
                     f"N={e['N']} needs chunking")
                 row += self._desc_packed(b, e)
-            ns = [self.norms[f"{i}.{n}"] for n in
-                  ("input_layernorm", "post_attention_layernorm",
-                   "pre_feedforward_layernorm", "post_feedforward_layernorm",
-                   "self_attn.q_norm", "self_attn.k_norm")]
-            self.lw.append(ns + sub)
-            row += [t.data_ptr() for t in ns]
+            ns = [self.norms[f"{i}.{n}"] if n else None for n in self.norm_names]
+            self.lw.append([t for t in ns if t is not None] + sub)
+            row += [t.data_ptr() if t is not None else 0 for t in ns]
             row += [1 if self.layer_types[i] == "sliding_attention" else 0, 0]
             assert len(row) == self.LAYERW_FIELDS, len(row)
             rows.append(row)
         self.layers_tbl = torch.tensor(rows, dtype=torch.int64, device=dev).contiguous()
 
     def _rope_tables(self):
-        rp = self.cfg.get("rope_parameters")
-        if rp is None:
-            rp = {"full_attention": {"rope_type": "default",
-                                     "rope_theta": self.cfg.get("rope_theta", 1e6)},
-                  "sliding_attention": {"rope_type": "default",
-                                        "rope_theta": self.cfg.get("rope_local_base_freq", 1e4)}}
-            if self.cfg.get("rope_scaling"):
-                rp["full_attention"].update(self.cfg["rope_scaling"])
+        rp = arch.rope_params(self.cfg)
         self.inv_local = self._rope_inv(rp["sliding_attention"]).contiguous()
         self.inv_global = self._rope_inv(rp["full_attention"]).contiguous()
 
@@ -434,6 +511,10 @@ class KernelRunner:
         # x' staging: up to 3 column-scaled copies of the hidden state (q/k/v)
         self.xbuf = z(3 * H * M)
         self.rsums = z(4096 * M, d=torch.float32)
+        # tensor-core GEMV (COBALT_BLK1632_MMA): f32 tile partials + per-tile counters, kept zero
+        kmax = max(self.vocab, 2 * self.inter, self.nqkv, H)
+        self.mpart = z(kmax, d=torch.float32)
+        self.mcnt = z(kmax + 1, d=torch.int32)   # per tile (MMA) or per row-group (CBK_CHUNK): <= kmax
         # + 8 tail stamps + 16 CBK_PROF sub-phase accumulators (see megakernel.cu)
         self.timings = torch.zeros(self.n_layers * self.STAMPS + 24, dtype=torch.int64,
                                    device=dev)
@@ -443,15 +524,17 @@ class KernelRunner:
         self.r = self.ext.MegaRunner()
         iv = [self.hidden, self.n_layers, self.n_heads, self.n_kv, self.head_dim,
               self.inter, self.vocab, self.M, self.max_ctx, self.sliding_window,
-              self.nq_dim, self.nkv_dim, self.nqkv, self.kv_group, self.xcap]
+              self.nq_dim, self.nkv_dim, self.nqkv, self.kv_group, self.xcap,
+              self.arch["norm_plus_one"], self.arch["act_gelu"],
+              self.KEYS_PER_BLOCK, self.SPLIT_MAX, self.xsmem_bytes]
         fv = [self.eps, self.attn_scale, self.embed_scale]
-        self.r.configure(self.layers_tbl, self.embed_desc, self.final_norm,
+        self.r.configure(self.layers_tbl, self.embed_desc, self.lm_head_desc, self.final_norm,
                          self.inv_local, self.inv_global, self.rope_cs, self.rope_sn,
                          self.kcache, self.vcache,
                          self.tokens, self.positions, self.h, self.h2, self.qkv,
                          self.attn_out, self.obuf, self.act, self.dbuf, self.partials,
                          self.logits, self.amax_val, self.amax_idx,
-                         self.xbuf, self.rsums, iv, fv, self.smem,
+                         self.xbuf, self.rsums, self.mpart, self.mcnt, iv, fv, self.smem,
                          int(os.environ.get("COBALT_MINB", 2)))
         # L2 prefetch of o_proj from the attention phase.
         # MEASURED on the 27B/1g: o_proj 3.37 -> 2.68 ms (-20%) but attention
@@ -505,6 +588,19 @@ class KernelRunner:
         nxt = self.amax_idx[self.blocks * M: self.blocks * M + M]
         return self.logits, nxt
 
+    def generate_inkernel(self, tokens, positions, n_steps):
+        """Greedy-generate `n_steps` tokens per sequence in ONE cooperative launch: the kernel
+        feeds its own argmax and advances positions on device (no per-token host round trip).
+        Returns an int32 device tensor [n_steps, M]; element [s, m] is the token chosen AT step s
+        (i.e. the input of step s+1).  Numerically the same per-step arithmetic as `step()`."""
+        M = self.M
+        tk = list(tokens) + [0] * (M - len(tokens))
+        ps = list(positions) + [0] * (M - len(positions))
+        assert max(ps) + n_steps <= self.max_ctx, "generation would exceed max_ctx"
+        out = torch.empty(n_steps, M, dtype=torch.int32, device=self.device)
+        self.r.generate(tk, ps, self._split_for(max(ps)), int(n_steps), out)
+        return out
+
     def prefill(self, ids_batch):
         """ids_batch: list (len <= M) of equal-length token-id lists.
         Runs the decode kernel token by token.  Returns logits at the last
@@ -537,6 +633,7 @@ class KernelRunner:
         # refcounting cannot break, so `del runner` would leave the 14 GB of weights
         # resident and the measured peak memory would nearly double.
         shared = {"blobs": self.blobs, "embed_desc": list(self.embed_desc),
+                  "lm_head_desc": list(self.lm_head_desc),
                   "norms": self.norms, "final_norm": self.final_norm}
 
         class _SharedWeights(PrefillRunner):
@@ -550,6 +647,7 @@ class KernelRunner:
                 sh = self._shared
                 self.blobs = sh["blobs"]
                 self.embed_desc = list(sh["embed_desc"])
+                self.lm_head_desc = list(sh["lm_head_desc"])
                 self.norms = sh["norms"]
                 self.final_norm = sh["final_norm"]
                 self._rope_tables()
@@ -564,12 +662,9 @@ class KernelRunner:
                             f"{self._want_layout(nm)} (COBALT_BLK1632/_O)")
                         assert e["N"] % 128 == 0, f"{nm}: N must be a multiple of 128"
                         row += self._desc(b, e)
-                    ns = [self.norms[f"{i}.{n}"] for n in
-                          ("input_layernorm", "post_attention_layernorm",
-                           "pre_feedforward_layernorm", "post_feedforward_layernorm",
-                           "self_attn.q_norm", "self_attn.k_norm")]
-                    self.keep.append(ns)
-                    row += [t.data_ptr() for t in ns]
+                    ns = [self.norms[f"{i}.{n}"] if n else None for n in self.norm_names]
+                    self.keep.append([t for t in ns if t is not None])
+                    row += [t.data_ptr() if t is not None else 0 for t in ns]
                     row += [1 if self.layer_types[i] == "sliding_attention" else 0, 0]
                     assert len(row) == 44
                     rows.append(row)

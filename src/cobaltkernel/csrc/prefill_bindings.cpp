@@ -40,7 +40,8 @@ class PrefillRunner {
   int blocks = 0, smem = 0, blocks_per_sm = 0;
   int bblocks = 0, bsmem = 0, bblocks_per_sm = 0;
 
-  void configure(torch::Tensor layers, std::vector<int64_t> embed, torch::Tensor final_norm,
+  void configure(torch::Tensor layers, std::vector<int64_t> embed, std::vector<int64_t> lm_head,
+                 torch::Tensor final_norm,
                  torch::Tensor inv_local, torch::Tensor inv_global, torch::Tensor rope_cs,
                  torch::Tensor rope_sn, torch::Tensor kcache, torch::Tensor vcache,
                  torch::Tensor tokens, torch::Tensor positions, torch::Tensor h, torch::Tensor xn, torch::Tensor qkvb,
@@ -48,10 +49,11 @@ class PrefillRunner {
                  torch::Tensor db, torch::Tensor hg, torch::Tensor logits,
                  torch::Tensor logit_rows, std::vector<int64_t> iv,
                  std::vector<double> fv) {
-    TORCH_CHECK(iv.size() == 18, "ints must have 18 entries, got ", iv.size());
+    TORCH_CHECK(iv.size() == 20, "ints must have 20 entries, got ", iv.size());
     TORCH_CHECK(fv.size() == 3, "floats must have 3 entries");
     a.layers = dp<pf::PLayerW>(layers);
     a.embed = desc_of(embed);
+    a.lm_head = desc_of(lm_head);
     a.final_norm = dp<__nv_bfloat16>(final_norm);
     a.inv_local = dp<float>(inv_local);
     a.inv_global = dp<float>(inv_global);
@@ -77,6 +79,7 @@ class PrefillRunner {
     a.max_ctx = (int)iv[i++]; a.sliding_window = (int)iv[i++];
     a.nq_dim = (int)iv[i++]; a.nkv_dim = (int)iv[i++]; a.nqkv = (int)iv[i++];
     a.kv_group = (int)iv[i++];
+    a.norm_plus_one = (int)iv[i++]; a.act_gelu = (int)iv[i++];
     a.batch_mode = 0;
     a.eps = (float)fv[0]; a.attn_scale = (float)fv[1]; a.embed_scale = (float)fv[2];
     smem = pf::pf_smem_bytes(a.head_dim);

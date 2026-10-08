@@ -126,6 +126,7 @@ pending() { "$PY_SUMM" "$SUMM" pending --arm "$1" --model "$MODEL" --slice "$MIG
 case $MODEL in
   gemma-3-4b)   GGUF_NAME=gemma-3-4b-it; DEFAULT_ARMS=(bf16 gptq awq nvfp4 gguf) ;;
   medgemma-27b) GGUF_NAME=medgemma-27b-text-it; DEFAULT_ARMS=(ref_fp8 gptq awq nvfp4 gguf) ;;
+  biomistral-7b) GGUF_NAME=biomistral-7b; DEFAULT_ARMS=(gguf) ;;   # CoBALT arms: scripts/run_biomistral_speed.sh
   *) echo "unknown model $MODEL"; exit 2 ;;
 esac
 [ ${#ARMS[@]} -eq 0 ] && ARMS=("${DEFAULT_ARMS[@]}")

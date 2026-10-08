@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
 # Build the "big files" overlay that a git clone of this repo is missing.
 #
-#   scripts/make_handoff_overlay.sh <out_dir> <hf_snapshot> <recipe>:<artifact_dir> [...]
+#   scripts/make_handoff_overlay.sh <out_dir> <model_name> <hf_snapshot> <recipe>:<artifact_dir> [...]
+#
+#   model_name    the artifact directory prefix and a shipped target in prod/recipes.py,
+#                 e.g. medgemma-27b or biomistral-7b
+#   hf_snapshot   directory holding config.json and the tokenizer files
 #
 # The partner clones the repo, unpacks this overlay AT THE REPO ROOT, and runs.
 # It deliberately contains NO code and NO documentation -- those come from the
@@ -11,17 +15,20 @@
 #   results/accel4bit/calib_*        -- .gitignore excludes results/, and every
 #                                       recipe pins this path, so stage 1 cannot
 #                                       run without it
-#   artifacts/<name>/                -- the packed CBK1 weights, plus config.json
+#   artifacts/<model_name>-<recipe>/ -- the packed CBK1 weights, plus config.json
 #                                       and the tokenizer, so serving needs no
 #                                       Hugging Face download at all
 set -euo pipefail
 
 OUT=${1:?output directory}; shift
+MODEL=${1:?model name (artifact prefix, e.g. biomistral-7b)}; shift
 SNAP=${1:?HF snapshot dir (config.json + tokenizer)}; shift
 [ $# -ge 1 ] || { echo "need at least one <recipe>:<artifact_dir>" >&2; exit 2; }
+[ -f "$SNAP/config.json" ] || { echo "no config.json in $SNAP" >&2; exit 2; }
 
 REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 CALIB="results/accel4bit/calib_ultrachat_512x2048.txt"
+TARNAME=$(basename "$OUT").tar
 
 rm -rf "$OUT"; mkdir -p "$OUT/results/accel4bit" "$OUT/artifacts"
 
@@ -35,24 +42,25 @@ NAMES=()
 for spec in "$@"; do
     recipe=${spec%%:*}; art=${spec#*:}
     [ -d "$art" ] || { echo "no such artifact dir: $art" >&2; exit 2; }
-    dest="$OUT/artifacts/medgemma-27b-$recipe"
+    dest="$OUT/artifacts/$MODEL-$recipe"
     echo "==> $recipe  ($(du -sh "$art" | cut -f1))"
     mkdir -p "$dest"
     cp -L "$art"/*.bin "$art"/manifest.json "$dest/"
     # config.json + tokenizer beside the weights: runner.py reads plain config.json
-    # keys (not AutoConfig), and load_pretrained() takes the tokenizer from the
-    # artifact dir -- so `--config` is never needed and no HF download is required.
+    # keys (not AutoConfig), prod picks the model target from the same file, and
+    # load_pretrained() takes the tokenizer from the artifact dir -- so `--config`
+    # is never needed and no HF download is required.
     for f in config.json generation_config.json tokenizer.json tokenizer_config.json \
              tokenizer.model special_tokens_map.json added_tokens.json; do
         [ -e "$SNAP/$f" ] && cp -L "$SNAP/$f" "$dest/"
     done
-    NAMES+=("medgemma-27b-$recipe")
+    NAMES+=("$MODEL-$recipe")
 done
 
 # ---- 3. how to use it ----
 DEFAULT=${NAMES[0]}
-cat > "$OUT/READ_ME_FIRST.md" <<EOF
-# CoBALT — the files the repository does not track
+cat > "$OUT/READ_ME_FIRST.md" <<EOT
+# CoBALT — the files the repository does not track ($MODEL)
 
 Unpack this **at the root of a clone** of the CoBALT repository. It adds two
 things and overwrites nothing:
@@ -63,12 +71,13 @@ things and overwrites nothing:
 ## Run it
 
     git clone <repo> && cd <repo>
-    tar -xf cobalt-bigfiles.tar            # or unzip, here, at the repo root
-    sha256sum -c SHA256SUMS                # optional; 11 GB transfers do get truncated
+    tar -xf $TARNAME            # or unzip, here, at the repo root
+    sha256sum -c SHA256SUMS                # optional; large transfers do get truncated
 
     export PYTHONPATH=\$PWD/src
     python -m prod doctor
     python -m prod verify   artifacts/$DEFAULT
+    python -m prod verify   artifacts/$DEFAULT --kernel        # kernel vs torch oracle
     python -m prod generate artifacts/$DEFAULT --prompt "A 54-year-old presents with" -n 64
     python -m prod bench    artifacts/$DEFAULT --prompt 512 --gen 128 --out bench.json
 
@@ -84,10 +93,10 @@ to rebuild the weights yourself; reproducing our numbers does not need it.
 
 $(for n in "${NAMES[@]}"; do echo "* \`artifacts/$n\`"; done)
 
-\`python -m prod recipes\` prints what each one measured. Everything else —
-setup, the format spec, the kernel internals, the limits — is in \`docs/\` in the
-clone, starting with \`docs/REPRODUCTION.md\`.
-EOF
+\`python -m prod targets\` prints what each arm measured on $MODEL and the protocol.
+Everything else — setup, the format spec, the kernel internals, the limits — is in
+\`docs/\` in the clone, starting with \`docs/REPRODUCTION.md\`.
+EOT
 
 echo "==> checksums"
 ( cd "$OUT" && find . -type f ! -name SHA256SUMS -print0 | sort -z \
@@ -97,11 +106,12 @@ echo "==> checksums"
 # Members must be ./results/... and ./artifacts/... with NO wrapping directory, so a
 # plain `tar -xf` at the repo root drops the files into place. Taring the directory
 # itself yields <repo>/<name>/results/... and the pinned calibration path stays missing.
-TAR="$OUT.tar"
+TAR="$(dirname "$OUT")/$TARNAME"
 echo "==> $TAR"
 tar -cf "$TAR" -C "$OUT" .
 sha256sum "$TAR" | tee "$TAR.sha256"
 
 echo; echo "overlay: $OUT"; du -sh "$OUT"; echo "files:   $(find "$OUT" -type f | wc -l)"
 echo "tarball: $TAR"
-echo "rootless check (must NOT start with a directory name):"; tar -tf "$TAR" | head -3
+echo "rootless check (must NOT start with a directory name):"
+{ tar -tf "$TAR" || true; } | head -3      # head closing the pipe must not fail the script

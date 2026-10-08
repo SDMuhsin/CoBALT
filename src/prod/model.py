@@ -1,8 +1,12 @@
 """Stage 3 -- serving.  One cooperative kernel launch per prefill, one per decode step.
 
     from prod import CobaltModel
-    m = CobaltModel.load("/models/medgemma-27b-cobalt-b1632-4", config_dir=<hf snapshot>)
+    m = CobaltModel.load_pretrained("artifacts/biomistral-7b-blk1632_b4")
     print(m.generate_text("A 54-year-old presents with", max_new_tokens=64))
+
+The recipe (the layout the kernel decodes) comes from the artifact's `manifest.json`; the
+model target (the per-model kernel tuning and the reference numbers) comes from the
+`config.json` beside the weights -- or from `config_dir` when the artifact has none.
 
 Shape of the runtime
 --------------------
@@ -48,10 +52,23 @@ def recipe_for_artifact(artifact_dir: str):
     return _recipes.get(_BY_LAYOUT[key])
 
 
+
+def _model_cfg(d: str | None) -> dict | None:
+    """The HF config.json (text_config unwrapped) next to `d`, for recipes.target_for()."""
+    import json as _json
+    if not d:
+        return None
+    p = os.path.join(d, "config.json")
+    if not os.path.exists(p):
+        return None
+    c = _json.load(open(p))
+    return c.get("text_config", c)
+
 class CobaltModel:
     """A packed CoBALT artifact bound to the megakernel, in one shipped configuration."""
 
     def __init__(self, runner, recipe, artifact_dir, tokenizer=None):
+        self._mcfg = None          # HF config dict -> recipes.target_for (set by load())
         self._r = runner
         self.recipe = recipe
         self.artifact_dir = artifact_dir
@@ -74,8 +91,9 @@ class CobaltModel:
         _env.configure()
         r = (_recipes.get(recipe) if isinstance(recipe, str)
              else recipe or recipe_for_artifact(artifact_dir))
+        mcfg = _model_cfg(config_dir or artifact_dir)
 
-        with _recipes.activate(r):
+        with _recipes.activate(r, mcfg):
             _bridge.install()
             # The recipe's knobs are COMPILE-TIME macros and, for the attention split, a
             # class attribute bound when runner.py is first imported -- so the import has
@@ -85,7 +103,9 @@ class CobaltModel:
             KernelRunner.KEYS_PER_BLOCK = int(os.environ.get("COBALT_KPB", 128))
             runner = KernelRunner(artifact_dir, M=batch, max_ctx=max_ctx,
                                   config_dir=config_dir, verbose=verbose)
-        return cls(runner, r, artifact_dir, tokenizer)
+        obj = cls(runner, r, artifact_dir, tokenizer)
+        obj._mcfg = mcfg
+        return obj
 
     @classmethod
     def load_pretrained(cls, artifact_dir: str, config_dir: str | None = None, **kw):
@@ -103,7 +123,7 @@ class CobaltModel:
     def generate(self, prompt_ids, max_new_tokens: int, use_prefill_kernel: bool = True):
         """Greedy generation from token ids. Returns the generated ids (prompt excluded)."""
         self.reset()
-        with _recipes.activate(self.recipe):
+        with _recipes.activate(self.recipe, self._mcfg):
             return self._r.generate(list(prompt_ids), max_new_tokens,
                                     use_prefill_kernel=use_prefill_kernel)
 
@@ -117,20 +137,28 @@ class CobaltModel:
 
     def prefill(self, prompt_ids):
         """Fill the KV cache for `prompt_ids` in one launch; returns logits [1, vocab]."""
-        with _recipes.activate(self.recipe):
+        with _recipes.activate(self.recipe, self._mcfg):
             return self._r.prefill_kernel(list(prompt_ids))
 
     def step(self, tokens, positions):
         """One decode launch. Returns (logits, argmax_ids)."""
-        with _recipes.activate(self.recipe):
+        with _recipes.activate(self.recipe, self._mcfg):
             return self._r.step(list(tokens), list(positions))
 
     # ------------------------------------------------------------------ info
     @property
+    def target(self):
+        """The shipped model target this artifact matched, or None."""
+        return _recipes.target_for(self._mcfg)
+
+    @property
     def stats(self) -> dict:
         r = self._r
+        t = self.target
         return {"recipe": self.recipe.name, "layout": self.recipe.layout,
                 "bpw": self.recipe.bpw, "artifact": self.artifact_dir,
+                "target": t.name if t else None,
+                "model_type": (self._mcfg or {}).get("model_type"),
                 "weight_bytes_per_token": r.weight_bytes(),
                 "batch_M": r.M, "max_ctx": r.max_ctx, "grid_blocks": r.blocks,
                 "layers": r.n_layers, "hidden": r.hidden, "vocab": r.vocab}

@@ -17,6 +17,11 @@ import os
 
 import torch
 
+try:
+    from cobaltkernel import arch
+except ImportError:          # run from inside src/cobaltkernel
+    import arch
+
 _EXT = None
 
 
@@ -43,6 +48,12 @@ def _build_ext(verbose=False):
     if blko is not None:
         assert int(blko) in (0, 4, 6), "COBALT_BLK1632_O must be 0, 4 or 6"
         flags.append(f"-DPF_BLK1632_O={int(blko)}")
+    # per-matrix overrides for the fused qkv GEMM / the down_proj GEMM (mixed arms B/C); unset = COBALT_BLK1632
+    for env, macro in (("COBALT_BLK1632_QKV", "PF_BLK1632_QKV"), ("COBALT_BLK1632_D", "PF_BLK1632_D")):
+        v = os.environ.get(env)
+        if v is not None:
+            assert int(v) in (0, 4, 6), f"{env} must be 0, 4 or 6"
+            flags.append(f"-D{macro}={int(v)}")
     if os.environ.get("COBALT_PF_BLK_LUT"):
         flags.append(f"-DCBK_GEMM_BLK_LUT={int(os.environ['COBALT_PF_BLK_LUT'])}")
     if os.environ.get("COBALT_PF_TAILSPLIT"):
@@ -52,8 +63,8 @@ def _build_ext(verbose=False):
         flags.append(f"-DPF_BATCH_MINB={int(minb)}")
     _EXT = load(
         name="cbk_prefill" + ("_" + "_".join(
-            f.split("-D")[-1].replace("=", "").replace("PF_BLK1632_O", "o")
-             .replace("PF_BLK1632", "").replace("CBK_GEMM_BLK_LUT", "lut")
+            f.split("-D")[-1].replace("=", "").replace("PF_BLK1632_QKV", "q").replace("PF_BLK1632_D", "d")
+             .replace("PF_BLK1632_O", "o").replace("PF_BLK1632", "").replace("CBK_GEMM_BLK_LUT", "lut")
              .replace("PF_TAILSPLIT", "ts").replace("PF_BATCH_MINB", "mb")
             for f in flags) if flags else ""),
         sources=[os.path.join(src, "prefill_bindings.cpp"),
@@ -86,23 +97,19 @@ class PrefillRunner:
         self.inter = cfg["intermediate_size"]
         self.vocab = cfg["vocab_size"]
         self.eps = cfg.get("rms_norm_eps", 1e-6)
-        self.sliding_window = cfg.get("sliding_window", 4096)
+        self.sliding_window = arch.sliding_window(cfg)
         self.nq_dim = self.n_heads * self.head_dim
         self.nkv_dim = self.n_kv * self.head_dim
         self.nqkv = self.nq_dim + 2 * self.nkv_dim
         self.kv_group = self.n_heads // self.n_kv
-        self.attn_scale = float(cfg.get("query_pre_attn_scalar", self.head_dim)) ** -0.5
-        self.embed_scale = float(torch.tensor(math.sqrt(H), dtype=torch.bfloat16).float())
+        self.attn_scale = arch.attn_scale(cfg)
+        self.arch = arch.flags(cfg)
+        self.embed_scale = self.arch["embed_scale"]
+        self.norm_names = arch.norm_names(cfg)
         self.max_tokens = max_tokens
         self.max_ctx = max_ctx or max_tokens
         self.max_logit_rows = max_logit_rows or max_tokens
-
-        pat = cfg.get("sliding_window_pattern", cfg.get("_sliding_window_pattern", 6))
-        if cfg.get("layer_types"):
-            self.layer_types = list(cfg["layer_types"])
-        else:
-            self.layer_types = ["sliding_attention" if bool((i + 1) % pat)
-                                else "full_attention" for i in range(self.n_layers)]
+        self.layer_types = arch.layer_types(cfg)
 
         self.kv_batch = kv_batch
         self._load_packed(model_dir)
@@ -124,8 +131,9 @@ class PrefillRunner:
     @staticmethod
     def _want_layout(name=None):
         blk = int(os.environ.get("COBALT_BLK1632", 0))
-        if name == "o_proj" and os.environ.get("COBALT_BLK1632_O") is not None:
-            blk = int(os.environ["COBALT_BLK1632_O"])
+        over = {"o_proj": "COBALT_BLK1632_O", "qkv": "COBALT_BLK1632_QKV", "down_proj": "COBALT_BLK1632_D"}.get(name)
+        if over and os.environ.get(over) is not None:
+            blk = int(os.environ[over])
         return {0: 1, 4: 6, 6: 7}[blk]
 
     def _load_packed(self, model_dir):
@@ -142,6 +150,13 @@ class PrefillRunner:
         self.embed_desc = self._desc(self.blobs["embed"], man["embed"])
         assert self.embed_desc[6] == self.hidden and self.embed_desc[5] >= self.vocab
         assert man["embed"]["layout"] in (1, 2), "embedding must be DENSE4/DENSE8"
+        if man.get("lm_head"):
+            self.blobs["lm_head"] = blob(man["lm_head"]["file"])
+            self.lm_head_desc = self._desc(self.blobs["lm_head"], man["lm_head"])
+            assert man["lm_head"]["layout"] in (1, 2), "lm_head must be DENSE4/DENSE8"
+        else:
+            assert self.arch["tied"], "untied model but no packed lm_head in the artifact"
+            self.lm_head_desc = list(self.embed_desc)
 
         misc = blob(man["misc"]["file"])
         self.norms = {}
@@ -165,16 +180,13 @@ class PrefillRunner:
                 assert e["layout"] == self._want_layout(nm), (
                     f"{nm}: layout {e['layout']} but the prefill kernel was built for "
                     f"layout {self._want_layout(nm)} (COBALT_BLK1632="
-                    f"{os.environ.get('COBALT_BLK1632', 0)}, COBALT_BLK1632_O="
-                    f"{os.environ.get('COBALT_BLK1632_O')})")
+                    f"{os.environ.get('COBALT_BLK1632', 0)}, _O={os.environ.get('COBALT_BLK1632_O')}, "
+                    f"_QKV={os.environ.get('COBALT_BLK1632_QKV')}, _D={os.environ.get('COBALT_BLK1632_D')})")
                 assert e["N"] % 128 == 0, f"{nm}: N must be a multiple of KT=128"
                 row += self._desc(b, e)
-            ns = [self.norms[f"{i}.{n}"] for n in
-                  ("input_layernorm", "post_attention_layernorm",
-                   "pre_feedforward_layernorm", "post_feedforward_layernorm",
-                   "self_attn.q_norm", "self_attn.k_norm")]
-            self.keep.append(ns)
-            row += [t.data_ptr() for t in ns]
+            ns = [self.norms[f"{i}.{n}"] if n else None for n in self.norm_names]
+            self.keep.append([t for t in ns if t is not None])
+            row += [t.data_ptr() if t is not None else 0 for t in ns]
             row += [1 if self.layer_types[i] == "sliding_attention" else 0, 0]
             assert len(row) == 44
             rows.append(row)
@@ -195,14 +207,7 @@ class PrefillRunner:
         return inv.to(self.device)
 
     def _rope_tables(self):
-        rp = self.cfg.get("rope_parameters")
-        if rp is None:
-            rp = {"full_attention": {"rope_type": "default",
-                                     "rope_theta": self.cfg.get("rope_theta", 1e6)},
-                  "sliding_attention": {"rope_type": "default",
-                                        "rope_theta": self.cfg.get("rope_local_base_freq", 1e4)}}
-            if self.cfg.get("rope_scaling"):
-                rp["full_attention"].update(self.cfg["rope_scaling"])
+        rp = arch.rope_params(self.cfg)
         self.inv_local = self._rope_inv(rp["sliding_attention"]).contiguous()
         self.inv_global = self._rope_inv(rp["full_attention"]).contiguous()
 
@@ -240,9 +245,9 @@ class PrefillRunner:
         iv = [self.hidden, self.n_run_layers, self.n_heads, self.n_kv, self.head_dim,
               self.inter, self.vocab, self.max_tokens, 1, 0, self.kv_b, 0,
               self.max_ctx, self.sliding_window, self.nq_dim, self.nkv_dim, self.nqkv,
-              self.kv_group]
+              self.kv_group, self.arch["norm_plus_one"], self.arch["act_gelu"]]
         fv = [self.eps, self.attn_scale, self.embed_scale]
-        self.r.configure(self.layers_tbl, self.embed_desc, self.final_norm,
+        self.r.configure(self.layers_tbl, self.embed_desc, self.lm_head_desc, self.final_norm,
                          self.inv_local, self.inv_global, self.rope_cs, self.rope_sn,
                          self.kcache, self.vcache, self.tokens, self.positions,
                          self.h, self.xn,

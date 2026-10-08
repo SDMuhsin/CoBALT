@@ -140,16 +140,110 @@ Hopper's warpgroup model. `wgmma.mma_async` is not used and does not compile for
 On Hopper you would leave the decode path alone (it is bandwidth-bound and would gain
 nothing) and could rewrite `gemm_tile` around `wgmma` for prefill.
 
-**To another model.** The Gemma3-specific parts are: the RoPE tables (two frequency sets,
-local and global), the sliding-window attention pattern, the QK-norm, the pre/post
-feed-forward norm pair, the embedding scale, and the tied embedding / lm_head.
-`ref_gemma3.py` is the executable specification of all of it in ~300 lines of readable
-torch — start there, get the reference right first, and only then change the kernel. The
-GEMV, the format and the packer are architecture-independent.
+**To another model.** Two families are wired (§6): Gemma3 and the llama family
+(Mistral / Llama). The family-specific parts are the RoPE tables, the sliding-window
+pattern, the QK-norm, the norm set per layer, the activation, the embedding scale and
+whether the lm_head is tied. `ref_gemma3.py` and `ref_llama.py` are the executable
+specifications, each ~300 lines of readable torch — start there, get the reference right
+first, and only then change the kernel. The GEMV, the format and the packer are
+architecture-independent; `arch.py` is where a new family's flags go.
 
 **Verification discipline.** Whatever you change, run
-`python -m prod verify <artifact> --config <hf> --kernel` and hold the 98.5% argmax bar
-against a torch oracle built from the *same packed bytes*. Batch M=4 must stay bit-exact
-against four independent M=1 runs — if it is not, some part of the reduction order has
-started depending on the batch size, which is a correctness bug even when the logits look
-close.
+`python -m prod verify <artifact> --kernel` and hold the 98.5% argmax bar against a torch
+oracle built from the *same packed bytes*. Batch M=4 must stay bit-exact against four
+independent M=1 runs on the row-loop build — if it is not, some part of the reduction
+order has started depending on the batch size, which is a correctness bug even when the
+logits look close. The one sanctioned exception is the tensor-core decode build
+(`COBALT_BLK1632_MMA=1`, BioMistral-7B): M=1 decodes qkv/o_proj on `mma` with f32 slice
+sums while M>1 keeps the row loop, so the gate there is identical greedy tokens plus a
+0.5 bound on max |logit diff| (measured 0.09–0.14, one bf16 ulp at these magnitudes).
+An exact tie in the reference's top-2 logits counts as agreement in every gate: bf16
+logits near 16–32 sit on a 0.125 grid and the reference cannot adjudicate a tie; the
+free-running greedy gate may fork at one (prefix must match), and the teacher-forced
+gate is what asserts every decode step.
+
+---
+
+## 6. Model families and the in-kernel generation loop (2026-10-06)
+
+The kernels now serve two families, read from `config.json` (`src/cobaltkernel/arch.py`):
+
+| | gemma3 (medgemma-27b, gemma-3-4b) | llama (BioMistral-7B / Mistral-7B, Llama) |
+|---|---|---|
+| norms per layer | 4, `bf16(x·rr·(1+w))` | 2, `bf16(bf16(x·rr)·w)`; `post_attn_ln`/`post_ff_ln` null → plain residual add |
+| QK-norm | yes | bypassed (null pointer) |
+| RoPE / sliding | local+global θ, 1-in-N sliding | one θ, uniform sliding window (Mistral) or none |
+| activation | GeGLU (`act_gelu=1`) | SwiGLU (`EPI_SWIGLU_BF16`) |
+| lm_head | tied to the embedding | separate `lm_head.bin` (DENSE4/DENSE8) |
+| query:kv ratio | KG=2 | KG=4 — a **compile-time** `CBK_KG` picked from the config; a mismatch is a hard error |
+
+All of this is runtime-switched except `CBK_KG`; the Gemma3 build is bit-identical to the pre-port kernel
+(`torch.equal` over 48 decode steps, `scripts/run_port_bitident.sh`). The executable spec for the llama family is
+`ref_llama.py` (fp32: `max|dlogit| = 0` vs transformers).
+
+**In-kernel greedy generation.** `MegaRunner.generate` / `KernelRunner.generate_inkernel(tokens, positions, n)` emits
+`n` tokens from ONE cooperative launch: the kernel feeds its own in-kernel argmax, advances positions and recomputes
+the attention key-split on device (per-step state lives in a `__shared__ Step`; never write to the by-value `Args`,
+it spills the whole parameter block). Tokens are identical to the one-launch-per-token path (127/127 in every
+record) and the decode rate becomes immune to host load — on a shared host that was worth 0–15%.
+
+**Knobs measured on BioMistral-7B (2g slice, GPU-side `clock64` step).** Ship:
+`COBALT_BLOCKS=160`, `COBALT_KPB=128`, `COBALT_ATTN_KUNROLL=4`, `COBALT_PVB=2` (the KG=4 build is at the 128-register
+bound; these un-spill it), stock R set. Measured NO on this part: KPB 32–64/256/1024, PVB 8/16, `COBALT_RMAX` 1/2,
+gate|up RP=1/split/RP=4, `COBALT_BLK1632_PFX=2`, MSCHED, MINB=1, o_proj prefetch, `COBALT_ATTN_COMBINE1`,
+`COBALT_CSPLIT=2` (wins on a 1g slice only), `COBALT_FUSE_RESID` 1/2, and the extended one-wave R set
+(`COBALT_RMAX=8`: R∈{3,5,6,8} for o/down — the fused qkv phase must keep a power-of-two R). Result of record:
+llama.cpp Q4_K_M 143.7 tok/s vs this kernel 138.4 in-kernel (0.963×) at 1.50× fewer bytes; +12.4% over the
+kernel's own DENSE4 layout.
+
+**Tensor-core decode of the L2-resident phases (2026-10-07, `csrc/cobalt_gemv_mma.cuh`).** The 16:32 planes are
+unchanged; `COBALT_BLK1632_MMA=1` runs the selected GEMV phases on `mma.m16n8k16` (bf16 × bf16 → f32): the shipped
+expansion produces the 8 code bytes per bitmap byte, one biased `PRMT` turns each pair into a bf16×2 A-fragment
+word (bf16 `0x43cc` is exactly `128 + cc`, so the bias of `COBALT_BLK1632_BIAS` carries over), x′ is loaded as bf16
+pairs straight into B (gate in column 0, up in column 1 — the interleaved gate|up rows need no repack), Σx′ per
+group comes from a second mma with an all-ones A, and the per-group `s·(C − (128+z)·Σx′)` epilogue runs on the C
+fragment. A warp owns a 16-row tile × column slice; slices of one tile are summed with f32 atomics and the
+last-arriving warp runs the epilogue (`Args.mpart` / `Args.mcnt`, kept zero between phases). Static cost: 155 SASS
+per 32-column row-granule vs 230 for the row loop. Measured: it **loses** on the DRAM-streaming matrices (gate|up,
+down, lm_head — its compute alone is slower than the row loop with its loads: latency-bound dependency chains, and
+every warp-level load touches 8 rows) and **wins** on the two phases that run L2-resident (qkv, o_proj), hence the
+per-phase mask `COBALT_MMA_PHASES` (bits: 1 qkv, 2 o_proj, 4 gate|up, 8 down, 16 lm_head; default 3). Prefetch
+depth `COBALT_MMA_PF_L2` (1 for those phases) / `COBALT_MMA_PF` (4 for streaming ones); unit sizing
+`COBALT_MMA_UPW` (target work units per warp, 2 — the per-unit fence + counter dominated o_proj at 4) with
+`COBALT_MMA_UPW_O=1` for o_proj alone (its K is the hidden size, the fewest tiles: it wants the largest units). Measured neutral or worse: `COBALT_MMA_ACC2` (two accumulator chains),
+`COBALT_MMA_COAL` (coalesced smem-staged loads: fixes the load pattern but its 30 KB/block buffer evicts attention's
+L1), lm_head on the MMA path. On BioMistral-7B this took the 2g-slice step from 7.20 to 6.80 ms with the oracle
+verify unchanged (99.0–99.3 % argmax; the fp32 slice sums make tokens order-nondeterministic, so the in-kernel/
+step-path token match is no longer a correctness signal — the verify is). The prod facade ships these knobs for the
+mistral family (`recipes.MODEL_TUNING`).
+
+**Round 3 (2026-10-08): decode attention on tensor cores, a cheaper expansion table, and a lookahead in the row decoder.**
+Same artifact and bytes; on BioMistral-7B the 2g-slice step went 6.84 → 6.15 ms (146 → 164 tok/s in-kernel, 1.14× llama.cpp
+Q4_K_M in the same window), all three verified with the record oracle protocol (tie-free prompt seed: every gate PASS, M=4
+bit-exact). Shipped for the mistral family in `recipes.MODEL_TUNING`:
+
+* `COBALT_ATTN_TC=1` — `phase_attn_tc`: S = Q·Kᵀ on `mma.m16n8k16` (A = the KG query heads of the GQA group padded to 16
+  rows, B = 8 keys straight from the K cache; the mma's k index is a permutation of the dims so each lane loads 8 contiguous
+  bytes per k-step), the online softmax on the C fragment (lane (g,t) owns 4 keys of head g), then Oᵀ = Vᵀ·Pᵀ with B = Pᵀ taken
+  from S's C fragment unchanged and A = Vᵀ via `movmatrix` transposes of 4-byte V loads. 16 keys per warp-chunk, every warp
+  of every block busy. The 8 warp states merge in one round through fp16 slots (`CBK_ATTN_TC_HALF`), and the last split
+  block of a kv-head does the cross-split reduce (`CBK_ATTN_TC_REDUCE`), so the `attn_reduce` phase and its barrier are gone.
+  attention 1.15 → 0.57 ms per token. **Shared memory is the constraint**: on GB202 L1 and smem share 128 KB per SM, and two
+  blocks × (static + dynamic) crossing the 32 KB carve-out step costs every GEMV phase 3–10 % (measured by inflating the
+  shipped build's dynamic smem alone) — hence the fp16 slots (8 KB) rather than f32 (16 KB); a 3-level register tree
+  (`CBK_ATTN_TC_TREE`) halves the smem too but its six `__syncthreads` cost more than it saves. The in-fragment q-RoPE
+  (`CBK_ATTN_TC_QROPE`) and hoisting all V loads (`CBK_ATTN_TC_VPRE`) are measured negatives (registers).
+* `COBALT_BLK1632_LUT=4` — the per-bitmap-byte table holds `{sel0, sel1, mk0, mk1}` as one `uint4`, so the pruned-slot byte
+  masks come from the table instead of two bit-spread multiplies per byte: −6 of ~22 ALU ops per 8-position expansion, and
+  the ALU pipe (16 lanes per partition, ~70 % of the decoder's SASS) is the decoder's binding pipe. −2.5 % step.
+* `COBALT_BLK1632_MSCHED=3 COBALT_BLK1632_PFH=2` — masks and nibbles of batch k+1 are issued before batch k is decoded (the
+  lookahead that makes a warp's own DRAM latency overlap its issue-bound decode), at PF 1 so the second buffer costs the
+  shipped register footprint (at PF 2 it spills: 7.6 ms). −3.2 % step. A cp.async shared-memory ring that does the same
+  decoupling (`csrc/cobalt_gemv_stream.cuh`, `COBALT_STREAM`) is a large negative here — smem carve-out plus issue slots.
+
+Measured negatives kept in-tree, default off: contiguous equal-work chunking of the walks (`COBALT_CHUNK`; the split-group
+atomics land at the end of every warp's work), the MMA tile loop on the streaming phases even with its scale/zero
+prefetched (`COBALT_MMA_SZPRE`, three configurations), and the items above. Measurement rules that this round
+re-learned: interleave shipped / control / candidate in ONE sweep (a build's phase times are not comparable across windows),
+and judge correctness by the oracle verify — the in-kernel-vs-step token match is a near-tie coin flip under the MMA slice
+sums (the shipped build flips it too).

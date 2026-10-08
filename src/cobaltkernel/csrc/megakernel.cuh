@@ -37,7 +37,8 @@ struct LayerW {
 
 struct Args {
   const LayerW* layers;
-  MatDesc embed;                    // embedding == lm_head (tied)
+  MatDesc embed;                    // token embedding
+  MatDesc lm_head;                  // == embed for tied models (gemma3); separate for llama
   const __nv_bfloat16* final_norm;
   const float* inv_local;
   const float* inv_global;
@@ -65,6 +66,24 @@ struct Args {
   float eps, attn_scale, embed_scale;
   int nq_dim, nkv_dim, nqkv, kv_group, xcap;
   int prefetch_o;   // 1 = L2-prefetch o_proj during the attention phase
+  // ---- model-family switches (arch.py).  A null norm pointer in LayerW bypasses that
+  // norm (plain residual add / no QK-norm); these two pick the arithmetic convention.
+  int norm_plus_one;  // 1: y = bf16(x*rr*(1+w)) (gemma)   0: y = bf16(bf16(x*rr)*w) (llama)
+  int act_gelu;       // 1: GeGLU (gelu_tanh)                0: SwiGLU (silu)
+  // ---- in-kernel greedy generation: ONE cooperative launch produces n_steps tokens.  Step 0 uses
+  // tok_v/pos_v; step s>0 feeds the previous step's in-kernel argmax and pos+1, recomputing the
+  // attention key-split with the host's formula (kpb, split_max).  n_steps == 1 is the classic
+  // one-launch-per-token path, bit-identical to before this field existed.
+  int n_steps;
+  int kpb, split_max;
+  int* out_tokens;    // [n_steps][M] chosen tokens (block 0 writes), or nullptr
+  // CBK_XSMEM: dynamic-smem budget (bytes) for staging a GEMV phase's activation x' once per block
+  // (0 = never stage; the phase reads x' from global/L1 as shipped).
+  int xsmem_bytes;
+  // CBK_BLK1632_MMA: f32 tile partials [max K] and per-tile arrival counters [max K / 16] for the
+  // (tile, column-slice) work units of the tensor-core GEMV; both are zero between phases.
+  float* mpart;
+  unsigned* mcnt;
 };
 
 }  // namespace cbk

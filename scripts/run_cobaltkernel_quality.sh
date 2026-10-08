@@ -3,6 +3,7 @@
 # scripts/run_accel4bit_ref.sh `bf16_quality` stage) for a "fake-quantized" bf16-format HF checkpoint of
 # gemma-3-4b or medgemma-27b, so numbers are comparable row-for-row with results/accel4bit/BASELINE.md.
 #
+# env LOG_SAMPLES=1 -> lm_eval --log_samples (per-question records in samples_<task>.json, for paired bootstrap stats)
 # Usage: scripts/run_cobaltkernel_quality.sh <model: gemma-3-4b|medgemma-27b> <hf_checkpoint_dir> <MIG-uuid> <tag> [tasks...]
 #   tasks (optional, space-separated, name[:limit]): default protocol set
 #     wikitext arc_easy medqa_4options pubmedqa medmcqa:1000
@@ -26,7 +27,7 @@ shift 4
 TASKS=("$@")
 [ ${#TASKS[@]} -eq 0 ] && TASKS=(wikitext arc_easy medqa_4options pubmedqa medmcqa:1000)
 
-case $MODEL in gemma-3-4b|medgemma-27b) ;; *) echo "unknown model $MODEL (want gemma-3-4b|medgemma-27b)"; exit 2 ;; esac
+case $MODEL in gemma-3-4b|medgemma-27b|biomistral-7b) ;; *) echo "unknown model $MODEL (want gemma-3-4b|medgemma-27b|biomistral-7b)"; exit 2 ;; esac
 [ -d "$CKPT" ] || { echo "checkpoint dir not found: $CKPT"; exit 2; }
 
 ROOT=/workspace/PTQResearch
@@ -99,7 +100,7 @@ else
   log "lm_eval (vllm) $CKPT -> $OUT  model_args=$MA tasks=${RUN_TASKS[*]}"
   T0=$(date +%s)
   $PY $ROOT/src/accel4bit_lmeval.py --backend vllm --pretrained "$CKPT" --out_dir "$OUT" --model_args "$MA" \
-      --batch_size auto --seed 1234 --include_path "$INCLUDE_PATH" --tasks "${RUN_TASKS[@]}" >> "$OUT/eval.log" 2>&1
+      --batch_size auto --seed 1234 --include_path "$INCLUDE_PATH" ${LOG_SAMPLES:+--log_samples} --tasks "${RUN_TASKS[@]}" >> "$OUT/eval.log" 2>&1
   EXIT=$?
   T1=$(date +%s)
   WALL=$((T1-T0))

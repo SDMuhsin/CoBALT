@@ -1,14 +1,17 @@
 """Command line for the CoBALT deployment package.
 
     python -m prod doctor                       # is this machine ready?
-    python -m prod recipes [name]               # what can I build, and what should it score?
+    python -m prod recipes [name]               # what can I build?
+    python -m prod targets                      # which models ship, and what did each score?
     python -m prod quantize  -r blk1632_b4 --model <hf> --out <raw>
     python -m prod pack      -r blk1632_b4 --raw <raw> --out <packed> --model <hf>
     python -m prod verify    <packed> [--config <hf>] [--kernel]
-    python -m prod bench     <packed> --config <hf> [--prompt 512 --gen 128]
-    python -m prod generate  <packed> --config <hf> --prompt "text" [-n 64]
+    python -m prod bench     <packed> [--config <hf>] [--prompt 512 --gen 128]
+    python -m prod generate  <packed> [--config <hf>] --prompt "text" [-n 64]
 
-Quantizing a 27B model takes hours; run it detached.
+`--config` is only needed when the artifact directory has no config.json beside the
+weights (the shipped overlays put it there).  Quantizing a 27B model takes hours; run it
+detached.
 """
 from __future__ import annotations
 
@@ -31,6 +34,9 @@ def main(argv=None):
 
     p = sub.add_parser("recipes", help="list the shipped arms")
     p.add_argument("name", nargs="?")
+    p.add_argument("--json", action="store_true")
+
+    p = sub.add_parser("targets", help="list the shipped models and their reference numbers")
     p.add_argument("--json", action="store_true")
 
     p = sub.add_parser("quantize", help="stage 1: HF checkpoint -> raw artifact")
@@ -91,7 +97,17 @@ def main(argv=None):
             print(json.dumps([dataclasses.asdict(r) for r in rs], indent=2))
         else:
             print(recipes.describe(a.name))
-            print("reference numbers were measured on:\n  " + recipes.REFERENCE_NOTE)
+            print("`python -m prod targets` lists the models and the measurement protocol.")
+        return 0
+
+    if a.cmd == "targets":
+        from . import recipes
+        if a.json:
+            import dataclasses
+            print(json.dumps([dataclasses.asdict(t) for t in recipes.TARGETS.values()],
+                             indent=2))
+        else:
+            print(recipes.describe_targets())
         return 0
 
     if a.cmd == "quantize":
@@ -123,8 +139,10 @@ def main(argv=None):
         if not rep["ok"]:
             return 1
         if a.kernel:
-            if not a.config:
-                ap.error("--kernel needs --config <hf snapshot>")
+            import os
+            if not a.config and not os.path.exists(os.path.join(a.artifact, "config.json")):
+                ap.error("--kernel needs --config <hf snapshot> when the artifact has no "
+                         "config.json beside the weights")
             verify.check_kernel(a.artifact, a.config, a.prompt_len, a.steps)
         return 0
 

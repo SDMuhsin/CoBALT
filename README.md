@@ -22,9 +22,9 @@ method is aimed at low-bit compression of language models.
 ## Deploying it: CUDA kernels and compressed weights
 
 Separately from the paper, this repository carries a CUDA inference stack that serves a
-CoBALT-compressed **MedGemma-27B** in one cooperative kernel launch per step, and the
-packaging around it. If you are here to *run* a compressed model rather than to read the
-method, start at **[docs/REPRODUCTION.md](docs/REPRODUCTION.md)**.
+CoBALT-compressed **MedGemma-27B** or **BioMistral-7B** in one cooperative kernel launch
+per step, and the packaging around it. If you are here to *run* a compressed model rather
+than to read the method, start at **[docs/REPRODUCTION.md](docs/REPRODUCTION.md)**.
 
 | | |
 |---|---|
@@ -34,8 +34,9 @@ method, start at **[docs/REPRODUCTION.md](docs/REPRODUCTION.md)**.
 
 **A clone is not self-sufficient.** `.gitignore` excludes `results/`, and the compressed
 weights were never in git, so the code and docs are all here but none of the data is. The
-weights and the calibration set ship separately as a drop-in overlay that you unpack at
-the repo root — see [docs/README.md](docs/README.md).
+weights and the calibration set ship separately as a drop-in overlay per model
+(`cobalt-bigfiles.tar` for MedGemma-27B, `cobalt-biomistral-bigfiles.tar` for
+BioMistral-7B) that you unpack at the repo root — see [docs/README.md](docs/README.md).
 
 ## Method source
 

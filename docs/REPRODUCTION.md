@@ -1,7 +1,9 @@
 # Reproduction guide
 
 Everything needed to build a CoBALT artifact from a Hugging Face checkpoint, verify it,
-and serve it with the custom CUDA kernels on your own GPU server.
+and serve it with the custom CUDA kernels on your own GPU server. Two models ship:
+**MedGemma-27B** (four arms) and **BioMistral-7B** (one arm); every command below is the
+same for both, with the artifact directory as the only thing that changes.
 
 Read the whole of §1 before starting: §1.3 in particular will save you an afternoon.
 
@@ -17,28 +19,34 @@ to reconcile against the clone.
 
 ```bash
 git clone <repo> && cd <repo>
-tar -xf cobalt-bigfiles.tar        # AT THE REPO ROOT; adds results/ and artifacts/
-sha256sum -c SHA256SUMS            # optional; 11 GB transfers do get truncated
+tar -xf cobalt-biomistral-bigfiles.tar   # AT THE REPO ROOT; adds results/ and artifacts/
+sha256sum -c SHA256SUMS                  # optional; large transfers do get truncated
 
 export PYTHONPATH=$PWD/src
-python -m prod doctor                                       # §1.3
-python -m prod verify   artifacts/medgemma-27b-<arm>        # §5, ~2 s, no GPU
-python -m prod generate artifacts/medgemma-27b-<arm> --prompt "A 54-year-old presents with" -n 64
-python -m prod bench    artifacts/medgemma-27b-<arm> --prompt 512 --gen 128 --out bench.json   # §7
+python -m prod doctor                                              # §1.3
+python -m prod verify   artifacts/biomistral-7b-blk1632_b4         # §5, ~2 s, no GPU
+python -m prod verify   artifacts/biomistral-7b-blk1632_b4 --kernel   # §5, kernel vs oracle
+python -m prod generate artifacts/biomistral-7b-blk1632_b4 --prompt "A 54-year-old presents with" -n 64
+python -m prod bench    artifacts/biomistral-7b-blk1632_b4 --prompt 512 --gen 128 --out bench.json   # §7
 ```
 
-What the overlay adds:
+The MedGemma overlay is `cobalt-bigfiles.tar` and unpacks the same way to
+`artifacts/medgemma-27b-<arm>`; both overlays can sit in one clone.
+
+What an overlay adds:
 
 | path | what it is | needed for |
 |---|---|---|
-| `artifacts/medgemma-27b-<arm>/` | packed CBK1 weights, plus `config.json` and the tokenizer | everything below |
+| `artifacts/<model>-<arm>/` | packed CBK1 weights, plus `config.json` and the tokenizer | everything below |
 | `results/accel4bit/calib_*` | the calibration set the recipes pin | **only** if you re-run stage 1 |
 
 **The weights are already built, so stages 1 (§3) and 2 (§4) are already done** — nothing
 on your side runs the quantizer, and reproducing our numbers does not touch the
 calibration file. `--config` is not needed either: `config.json` and the tokenizer sit
-beside the weights, so no Hugging Face download is required. The recipe is read out of
-`manifest.json`, so an artifact cannot be paired with the wrong kernel configuration.
+beside the weights, so no Hugging Face download is required. The recipe (the layout) is
+read out of `manifest.json` and the model target (the per-model kernel tuning and the
+reference numbers) out of `config.json`, so an artifact cannot be paired with the wrong
+kernel configuration.
 
 Read §1 (prerequisites), §5 (what verify proves), §7 (the measurement protocol) and §8
 (where this design does not win). §3 and §4 are background — read them to understand what
@@ -58,7 +66,7 @@ so a disagreement can only come from the kernel or the hardware.
 |---|---|
 | NVIDIA GPU, compute capability **8.0+** (Ampere or newer) | the prefill kernel uses `mma.sync.m16n8k16.bf16`, which is sm_80+ |
 | **cooperative launch** support | the whole design is one `cudaLaunchCooperativeKernel` per step |
-| VRAM ≥ artifact + KV cache | MedGemma-27B: 11.0–14.2 GB of weights, plus ~0.48 MiB per token of context |
+| VRAM ≥ artifact + KV cache | MedGemma-27B: 11.0–14.2 GB of weights, plus ~0.48 MiB per token of context; BioMistral-7B: 2.9 GB plus 0.125 MiB per token |
 
 Our numbers were taken on one **MIG 2g.48gb slice** of an RTX PRO 6000 Blackwell
 (compute capability 12.0, 94 SMs, 770.8 GB/s measured read bandwidth). Any Ampere,
@@ -74,9 +82,14 @@ per token and is identical for every arm, so for the 11 GB arms:
 | 4 096 | 10.4 GB | 1.9 GB | 12.3 GB |
 | 16 384 | 10.4 GB | 7.7 GB | 18.1 GB |
 
+**BioMistral-7B fits anywhere.** Its KV term is 0.125 MiB per token (32 layers, 8 kv
+heads of 128, bf16), so the 2.92 GB artifact plus a 16k context is under 5 GB; the peak we
+measured at 512→128 with the in-kernel batch of 8 was 3.9 GB. Any 8 GB card holds it.
+
 Note that **serving needs far less memory than quantizing**. §3 streams a 27B checkpoint
 through a 48 GB slice; if your card is smaller than that, take the prebuilt-package route
-in §0 rather than trying to build the artifact locally.
+in §0 rather than trying to build the artifact locally. (Quantizing BioMistral-7B peaks at
+5.6 GB and takes about six minutes.)
 
 ### 1.2 Software
 
@@ -155,22 +168,28 @@ and the checks that tell you whether a build is good. Both directories are requi
 ## 2. Pick a recipe
 
 ```bash
-python -m prod recipes                 # all four, with what each one measured
+python -m prod recipes                 # all four arms, with what each measured per model
 python -m prod recipes blk1632_b4      # just one
+python -m prod targets                 # the two shipped models, their tuning, the protocol
 ```
 
-A **recipe** is one deployable arm, pinned end to end: quantizer flags, packer flags, the
-kernel's compile-time and runtime knobs, and the numbers we measured for it. Nothing in
-this package runs without one, and the artifact's own manifest is enough to infer which
-recipe built it (`prod.recipe_for_artifact`), so an artifact cannot be paired with the
-wrong kernel configuration by accident.
+A **recipe** is one deployable arm, pinned end to end: quantizer flags, packer flags and
+the kernel knobs that belong to the layout. It is model-independent — the same
+`blk1632_b4` recipe built the MedGemma-27B and the BioMistral-7B artifacts. A **target**
+is one shipped model: the per-model kernel tuning that sits on top of the recipe's knobs
+and the numbers each arm measured on it. Nothing in this package runs without a recipe;
+the artifact's own manifest is enough to infer which one built it
+(`prod.recipe_for_artifact`), and its `config.json` picks the target, so an artifact
+cannot be paired with the wrong kernel configuration by accident. A model with no target
+runs the recipe exactly as pinned.
 
-If you have no strong preference, use **`blk1632_b4_oproj`**: the best quality per byte of
-the four, within 0.4% of the fastest arm's decode rate.
+If you have no strong preference on MedGemma-27B, use **`blk1632_b4_oproj`**: the best
+quality per byte of the four, within 0.4% of the fastest arm's decode rate. BioMistral-7B
+ships **`blk1632_b4`** only.
 
-> **Why recipes are not just documentation.** The kernel has about 25 environment knobs,
-> and six of them (`COBALT_BLK1632_NOOVH`, `COBALT_ATTN_DIAG`, `COBALT_BLK1632_HALFJ`,
-> `COBALT_BLK1632_NOLD`, `COBALT_XSYNC`, `COBALT_BLK1632_NOXB`) are *diagnostics that
+> **Why recipes are not just documentation.** The kernel has about 40 environment knobs,
+> and eleven of them (`COBALT_BLK1632_NOOVH`, `COBALT_ATTN_DIAG`, `COBALT_BLK1632_HALFJ`,
+> `COBALT_BLK1632_NOLD`, `COBALT_XSYNC`, `COBALT_BLK1632_NOXB`, ...) are *diagnostics that
 > deliberately compute the wrong answer* — they exist to price a lever by deleting the
 > work it does. A stray export of any of them gives you a fast model that quietly
 > generates worse text, and nothing complains. Every entry point here runs inside
@@ -220,7 +239,9 @@ Per matrix, using a calibration set of 128 sequences × 2048 tokens:
 5. **Per-column scale + group-128 asymmetric RTN** over the survivors.
 
 Steps 1, 2, 4 and 5 are identical across all four recipes. The only thing that changes is
-step 3, and — for `blk1632_b6_oproj4` — the code width.
+step 3, and — for `blk1632_b6_oproj4` — the code width. The BioMistral-7B artifact is the
+plain `blk1632_b4` recipe applied to the BioMistral-7B checkpoint: same calibration set,
+same 128 sequences, same flags (`python -m prod quantize -r blk1632_b4 --model <snapshot>`).
 
 ### Calibration data
 
@@ -302,18 +323,34 @@ session in the DENSE4 path.
 ### Full kernel verification
 
 ```bash
-python -m prod verify /artifacts/medgemma-27b-cbk1 \
-    --config /models/medgemma-27b-text-it --kernel
+python -m prod verify artifacts/biomistral-7b-blk1632_b4 --kernel      # config.json beside the weights
+python -m prod verify /artifacts/medgemma-27b-cbk1 --config /models/medgemma-27b-text-it --kernel
 ```
 
 Builds the extension and runs the megakernel against a pure-torch reference forward pass
-(`src/cobaltkernel/ref_gemma3.py`) built by dequantizing **the same packed bytes**, so a
-disagreement can only be a kernel bug, never a quantization difference. It reports:
+(`src/cobaltkernel/ref_gemma3.py` or `ref_llama.py`, picked from `config.json`) built by
+dequantizing **the same packed bytes**, so a disagreement can only be a kernel bug, never
+a quantization difference. It reports:
 
 * per-position max |logit difference| and argmax agreement over the whole prompt;
-* 32 greedy decode steps, token for token;
-* batch M=4 over four prompts against four independent M=1 runs (must be *bit-exact*);
+* 32 greedy decode steps, token for token, free-running and teacher-forced;
+* batch M=4 over four prompts against four independent M=1 runs — *bit-exact* on the
+  row-loop build (every MedGemma arm). On the tensor-core decode build that serves
+  BioMistral-7B, M=1 decodes qkv/o_proj on `mma` with f32 slice sums while M>1 keeps the
+  row loop, so there the gate is identical greedy tokens plus a 0.5 bound on max |logit
+  diff| (measured 0.09–0.14; one bf16 ulp at these magnitudes). `prod` selects the rule
+  from the active kernel configuration; it is printed with the result;
 * prefill-kernel → decode-kernel handoff through the shared KV cache.
+
+An **exact tie** in the reference's top-2 logits counts as agreement in every gate: bf16
+logits near 16–32 sit on a 0.125 grid and the reference cannot adjudicate a tie. In the
+free-running greedy gate a tie forks the two streams for good, so the rule there is: the
+prefix up to the tie must match, and the teacher-forced gate (which feeds the kernel the
+reference's own tokens and compares every step) covers the rest. The verifier reports
+every tie it used. On BioMistral-7B the default prompt hits one such tie at the eighth
+generated token, and the tensor-core build's f32 atomic sums make which side it falls on
+a coin flip — which is exactly why the teacher-forced gate, not the free-running one, is
+the decode-path assertion.
 
 Leave `--prompt-len` at its default of 1152: that is the length the bar below was
 established at, and over 128 positions a single disagreement moves the figure by 0.8 pt.
@@ -332,10 +369,10 @@ comparing something against itself.
 import sys; sys.path.insert(0, "/path/to/repo/src")
 from prod import CobaltModel
 
-m = CobaltModel.load_pretrained(
-        "/artifacts/medgemma-27b-cbk1",
-        config_dir="/models/medgemma-27b-text-it",
-        max_ctx=2048)
+m = CobaltModel.load_pretrained("artifacts/biomistral-7b-blk1632_b4", max_ctx=2048)
+# or, for an artifact without config.json beside the weights:
+# m = CobaltModel.load_pretrained("/artifacts/medgemma-27b-cbk1",
+#                                 config_dir="/models/medgemma-27b-text-it", max_ctx=2048)
 
 print(m.generate_text("A 54-year-old presents with crushing chest pain and",
                       max_new_tokens=128))
@@ -375,12 +412,12 @@ Protocol: a 512-token prompt through the prefill kernel, then 128 tokens through
 decode kernel, greedy, batch 1. `decode_tok_s` covers tokens 2..128 only, so TTFT is
 excluded and the number is a like-for-like decode rate.
 
-The output ends with a comparison against what we measured for the same recipe. On
-different hardware the absolute tok/s will differ — decode is bandwidth-bound, so it
-tracks your card's memory bandwidth — but the **ratios between arms** should reproduce.
-The comparison withholds ratios entirely if you benchmark a different model than the
-reference (e.g. a 4B smoke test against the 27B reference), rather than printing a
-flattering number that means nothing.
+The output ends with a comparison against what we measured for the same recipe **on the
+same model** (the target is read from the artifact's `config.json`). On different
+hardware the absolute tok/s will differ — decode is bandwidth-bound, so it tracks your
+card's memory bandwidth — but the **ratios between arms** should reproduce. The
+comparison withholds ratios entirely if you benchmark a model we ship no numbers for
+(e.g. a 4B smoke test), rather than printing a flattering number that means nothing.
 
 ### Two measurement rules, learned expensively
 
@@ -401,7 +438,26 @@ stable; trust that and treat the phase table as attribution, not measurement.
 
 ## 8. What to expect, and where this design does not win
 
-MedGemma-27B, one 2g.48gb slice, 512→128, batch 1, against llama.cpp Q4_K_M measured on
+**BioMistral-7B**, one 2g.48gb slice, 512→128, batch 1, llama.cpp Q4_K_M (imatrix)
+interleaved in the same window and pinned to the same cores, mean of two passes:
+
+| | Q4_K_M | `blk1632_b4` |
+|---|---|---|
+| weights | 4.37 GB | **2.92 GB** |
+| decode | 143.8 tok/s | **164.3 tok/s** (1.14×; 164.8 generated inside one launch) |
+| TTFT (512 tok) | 77 ms | 112 ms |
+| medical avg | 53.23 | 49.72 |
+| wikitext PPL | 13.57 | 15.47 |
+
+The speed comes from the tensor-core decode build (`python -m prod targets` lists the
+knobs; `docs/KERNELS.md` §6 explains each): the shipped row-loop kernel measured 146.7
+tok/s on the same artifact in the same window. **The quality does not carry over from
+MedGemma.** On this 7B model the arm sits 3.5 pt below Q4_K_M on the medical average
+(bf16 is 53.47), and the package ships that artifact exactly as measured. The same layout
+with medical calibration and block-wise reconstruction measured −0.9 pt (mean of three
+calibration draws) at identical bytes and identical kernel step; it is not what ships.
+
+**MedGemma-27B**, one 2g.48gb slice, 512→128, batch 1, against llama.cpp Q4_K_M measured on
 the same slice under the same protocol:
 
 | | Q4_K_M | `blk1632_b4` | `blk1632_b4_oproj` |
@@ -424,9 +480,14 @@ Being straight about the limits:
 * **Perplexity regresses** even where downstream task accuracy improves: 16.6 vs 11.6
   wikitext for Q4_K_M. The medical and ARC-easy numbers are what we optimised and what we
   report; the perplexity number is in the table because leaving it out would be dishonest.
-* **The 27B target is Gemma3-architecture text models.** The reference forward pass,
-  the RoPE tables and the sliding-window attention pattern are Gemma3-specific. Porting to
-  another architecture is real work — see [KERNELS.md](KERNELS.md) §5.
+* **Two architectures are wired: Gemma3 and the llama family (Mistral / Llama).** The
+  reference forward passes, RoPE tables, norm sets and attention patterns are per family
+  (`src/cobaltkernel/arch.py`). Porting to a third is real work — see
+  [KERNELS.md](KERNELS.md) §5–§6.
+* **The batch gate is weaker on the tensor-core build.** On BioMistral-7B, M=4 agrees with
+  four M=1 runs to one bf16 ulp rather than bit-exactly (§5), because M=1 alone uses the
+  tensor-core path. Batched decode (M>1) runs the row-loop kernel and gains none of the
+  round-3 speed.
 
 ---
 
@@ -485,4 +546,12 @@ python -m prod verify /artifacts/mg27b-cbk1 \
 
 python -m prod bench  /artifacts/mg27b-cbk1 \
     --config /models/medgemma-27b-text-it            # 7. the number
+```
+
+With a shipped overlay the same thing is three lines, no `--config`, no stages 3–4:
+
+```bash
+python -m prod verify   artifacts/biomistral-7b-blk1632_b4 --kernel
+python -m prod bench    artifacts/biomistral-7b-blk1632_b4 --out bench.json
+python -m prod generate artifacts/biomistral-7b-blk1632_b4 --prompt "..." -n 64
 ```

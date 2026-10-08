@@ -9,7 +9,11 @@ Tests
         over ALL positions.  Bar = the bf16 HF-eager-vs-HF-sdpa floor recorded in
         results/cobaltkernel/ref_verify_gemma-3-4b.txt (98.61 % argmax, 32/32 greedy).
   (ii)  32 greedy decode steps: token-for-token agreement.
-  (iii) batch M=4 over 4 different prompts == 4 independent M=1 runs.
+  (ii-b) teacher-forced decode: the kernel fed the reference's own tokens, argmax per step.
+  (iii) batch M=4 over 4 different prompts == 4 independent M=1 runs (bit-exact for the
+        row-loop build; identical tokens + --batch-tol logits for the tensor-core build).
+  An EXACT tie in the reference's top-2 logits counts as agreement everywhere: the
+  reference cannot adjudicate it, and bf16 logits near 16-32 tie at a 0.125 grid.
   --bisect: per-layer h dump (kernel) vs ref, to localise a mismatch.
 """
 
@@ -21,7 +25,8 @@ import sys
 import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from cobaltkernel import ref_gemma3 as R          # noqa: E402
+from cobaltkernel import arch                     # noqa: E402
+from cobaltkernel import ref_gemma3 as R          # noqa: E402  (re-bound per model family in main)
 from cobaltkernel.runner import KernelRunner      # noqa: E402
 from cobaltkernel import dequant_ref as DQ        # noqa: E402
 
@@ -53,8 +58,9 @@ def _attention_fp32probs(cfg, W, p, h, cos, sin, kv_layer, layer_type, q_positio
     q = F.linear(h, W[p + "self_attn.q_proj.weight"]).view(1, T, cfg.num_attention_heads, D).transpose(1, 2)
     k = F.linear(h, W[p + "self_attn.k_proj.weight"]).view(1, T, cfg.num_key_value_heads, D).transpose(1, 2)
     v = F.linear(h, W[p + "self_attn.v_proj.weight"]).view(1, T, cfg.num_key_value_heads, D).transpose(1, 2)
-    q = R.rms_norm(q, W[p + "self_attn.q_norm.weight"], cfg.rms_norm_eps)
-    k = R.rms_norm(k, W[p + "self_attn.k_norm.weight"], cfg.rms_norm_eps)
+    if (p + "self_attn.q_norm.weight") in W:          # QK-norm: gemma3 only
+        q = R.rms_norm(q, W[p + "self_attn.q_norm.weight"], cfg.rms_norm_eps)
+        k = R.rms_norm(k, W[p + "self_attn.k_norm.weight"], cfg.rms_norm_eps)
     q = R.apply_rope(q, cos, sin)
     k = R.apply_rope(k, cos, sin)
     if append:
@@ -112,6 +118,11 @@ def main():
     ap.add_argument("--batch-steps", type=int, default=8)
     ap.add_argument("--bisect", action="store_true")
     ap.add_argument("--skip-batch", action="store_true")
+    ap.add_argument("--batch-tol", type=float, default=0.0,
+                    help="(iii) max |logit diff| allowed between M=4 and M=1 (tokens must still be "
+                         "identical). 0 = bit-exact, the rule for the row-loop build. The tensor-core "
+                         "decode build (COBALT_BLK1632_MMA=1) runs qkv/o_proj on mma with fp32 slice sums "
+                         "at M=1 only, so M=4 is a different (correct) reduction order there.")
     ap.add_argument("--skip-prefill-kernel", action="store_true",
                     help="skip test (iv): the PREFILL megakernel + this decode "
                          "megakernel vs decode-only, through KernelRunner.generate()")
@@ -128,6 +139,11 @@ def main():
     T = a.prompt_len
     cfgdir = a.config or a.model
     refdir = a.ref_model or a.model
+    global R
+    import json as _json
+    R = arch.ref_module(_json.load(open(os.path.join(cfgdir, "config.json"))))
+    P(f"[ref] family={arch.family_of(_json.load(open(os.path.join(cfgdir, 'config.json'))))} "
+      f"spec={R.__name__}")
     ids = get_ids(cfgdir, T, seed=a.prompt_seed)
     max_ctx = T + a.steps + 8
 
@@ -199,6 +215,7 @@ def main():
     # ---------------- kernel ----------------
     r = KernelRunner(a.model, M=1, max_ctx=max_ctx, config_dir=a.config)
     P(f"model     : {a.model}   (quantized={r.quantized})")
+    quantized = r.quantized
     P(f"oracle    : {refdir}")
     P(f"grid      : {r.blocks} blocks x 256 thr ({r.blocks_per_sm} blocks/SM), "
       f"{r.smem} B dynamic smem")
@@ -221,7 +238,7 @@ def main():
 
     # (i) prefill token-by-token
     r.reset()
-    stats = {k: dict(n=0, mx=0.0, mean=0.0, bad=[]) for k in ("prefill", "step", "fp32p")}
+    stats = {k: dict(n=0, mx=0.0, mean=0.0, bad=[], ties=0) for k in ("prefill", "step", "fp32p")}
     for t in range(T):
         lg, nxt = r.step([ids[t]], [t])
         kl = lg[0].float().cpu()
@@ -236,6 +253,9 @@ def main():
             ra = int(ref.argmax())
             if ka == ra:
                 st_["n"] += 1
+            elif float(ref[ka]) == float(ref[ra]):
+                st_["n"] += 1          # exact tie in the reference: not adjudicable
+                st_["ties"] += 1
             elif len(st_["bad"]) < 5:
                 st_["bad"].append((t, ra, ka, float(ref[ra]), float(ref[ka])))
     # reference self-consistency: same weights, same spec, GEMM vs GEMV
@@ -253,7 +273,8 @@ def main():
         P(f"  {label}")
         P(f"     max |diff|       : {st_['mx']:.6f}")
         P(f"     mean |diff|      : {st_['mean']/T:.6f}")
-        P(f"     argmax agreement : {st_['n']/T*100:.4f}%  ({st_['n']}/{T})")
+        P(f"     argmax agreement : {st_['n']/T*100:.4f}%  ({st_['n']}/{T}"
+          + (f", incl. {st_['ties']} exact ties in the reference" if st_["ties"] else "") + ")")
         for t, ra, ka, l1, l2 in st_["bad"]:
             P(f"       pos {t}: ref={ra} ({l1:.5f}) kernel={ka} (ref logit {l2:.5f})")
     P(f"  CONTROL A  ref.prefill vs ref.forward_step (same code; GEMM vs GEMV):")
@@ -292,7 +313,7 @@ def main():
     r.reset()
     for t in range(T):
         r.step([ids[t]], [t])
-    tf_n, tf_mx, tf_mean, tf_bad = 0, 0.0, 0.0, []
+    tf_n, tf_mx, tf_mean, tf_bad, tf_ties = 0, 0.0, 0.0, [], 0
     for s in range(a.steps):
         lg, nxt = r.step([fp32p_tokens[s]], [T + s])
         kl = lg[0].float().cpu()
@@ -303,19 +324,37 @@ def main():
         ka, ra = int(kl.argmax()), int(ref.argmax())
         if ka == ra:
             tf_n += 1
+        elif float(ref[ka]) == float(ref[ra]):
+            tf_n += 1; tf_ties += 1       # exact tie in the reference: not adjudicable
         elif len(tf_bad) < 6:
             tf_bad.append((T + s, ra, ka, float(ref[ra]), float(ref[ka])))
     P("== (ii-b) teacher-forced decode (kernel fed the reference's tokens) ==")
     P(f"  positions {T}..{T + a.steps - 1}")
     P(f"     max |diff|       : {tf_mx:.6f}")
     P(f"     mean |diff|      : {tf_mean / a.steps:.6f}")
-    P(f"     argmax agreement : {tf_n}/{a.steps}   <== decode-path gate")
+    P(f"     argmax agreement : {tf_n}/{a.steps}   <== decode-path gate"
+      + (f"   ({tf_ties} exact tie(s) in the reference counted as agreement)" if tf_ties else ""))
     for t, ra, ka, l1, l2 in tf_bad:
         P(f"       pos {t}: ref={ra} ({l1:.5f}) kernel={ka} (ref logit {l2:.5f})")
     P("")
 
     ok_i = agree >= FLOOR_ARGMAX
     ok_ii = nker_fp == a.steps
+    # A free-running greedy stream forks for good at the first disagreement, so a
+    # non-adjudicable EXACT tie in the reference's top-2 at that step is a legitimate fork,
+    # not a kernel error: the prefix up to it must match, and the teacher-forced gate
+    # (ii-b) covers every position past it.
+    if not ok_ii:
+        s0 = next(i for i in range(a.steps) if ker_tokens[i] != fp32p_tokens[i])
+        if s0 >= 1:
+            ref0 = fp32p_logits[s0 - 1]
+            ref0 = ref0[0] if ref0.dim() > 1 else ref0
+            if float(ref0[ker_tokens[s0]]) == float(ref0[fp32p_tokens[s0]]):
+                ok_ii = True
+                P(f"  (ii) streams fork at step {s0 - 1} on an EXACT tie in the reference "
+                  f"({ker_tokens[s0]} vs {fp32p_tokens[s0]} at {float(ref0[ker_tokens[s0]]):.5f}); "
+                  f"prefix {s0}/{s0} identical -> counted as PASS, (ii-b) gates the remainder")
+                P("")
     ok_iib = tf_n == a.steps
     ok_iii = True
     ok_iv = True
@@ -409,11 +448,12 @@ def main():
             s_tokens.append(tk)
         del r1
         gc.collect(); torch.cuda.empty_cache()
-        P("== (iii) batch M=4 vs 4x M=1 ==")
+        P(f"== (iii) batch M=4 vs 4x M=1 ({'bit-exact' if a.batch_tol == 0 else f'max|diff| <= {a.batch_tol}'}"
+          f", decode tokens identical) ==")
         for i in range(4):
             d = (b_logits[i] - s_logits[i]).abs().max().item()
             same = b_tokens[i] == s_tokens[i]
-            ok_iii &= (d == 0.0) and same
+            ok_iii &= (d <= a.batch_tol) and same
             P(f"  seq {i}: prefill-last max|diff|={d:.6g}  decode tokens identical={same}")
             if not same:
                 P(f"      M=4: {b_tokens[i]}")
@@ -421,16 +461,19 @@ def main():
         P("")
 
     P(f"(i)  prefill argmax >= floor (vs kernel-dtype ref) : {'PASS' if ok_i else 'FAIL'}")
-    P(f"(ii) greedy {a.steps}/{a.steps} tokens    : {'PASS' if ok_ii else 'FAIL'}")
+    P(f"(ii) greedy {nker_fp}/{a.steps} tokens{' (forked at an exact tie)' if ok_ii and nker_fp != a.steps else ''}    : "
+      f"{'PASS' if ok_ii else 'FAIL'}")
     P(f"(ii-b) teacher-forced decode {tf_n}/{a.steps} : {'PASS' if ok_iib else 'FAIL'}")
-    P(f"(iii) batch equivalence      : {'PASS' if ok_iii else 'FAIL'}")
-    P(f"(iv) prefill-kernel + decode : {'PASS' if ok_iv else 'FAIL'}")
-    P("RESULT: " + ("PASS" if (ok_i and ok_ii and ok_iii and ok_iv) else "FAIL"))
+    P(f"(iii) batch equivalence{' (bit-exact)' if a.batch_tol == 0 else f' (tol {a.batch_tol})'} : "
+      f"{'PASS' if ok_iii else 'FAIL'}")
+    P(f"(iv) prefill-kernel + decode : "
+      f"{'SKIPPED (--skip-prefill-kernel)' if (a.skip_prefill_kernel or not quantized) else ('PASS' if ok_iv else 'FAIL')}")
+    P("RESULT: " + ("PASS" if (ok_i and ok_ii and ok_iib and ok_iii and ok_iv) else "FAIL"))
 
     if a.out:
         os.makedirs(os.path.dirname(a.out), exist_ok=True)
         open(a.out, "w").write("\n".join(log) + "\n")
-    return 0 if (ok_i and ok_ii and ok_iii and ok_iv) else 1
+    return 0 if (ok_i and ok_ii and ok_iib and ok_iii and ok_iv) else 1
 
 
 if __name__ == "__main__":
